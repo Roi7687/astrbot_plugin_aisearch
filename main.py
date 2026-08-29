@@ -135,7 +135,11 @@ class CloakSearchPlugin(Star):
     @filter.event_message_type(EventMessageType.ALL)
     async def on_image_message(self, event: AstrMessageEvent):
         """@机器人 + 图片（或私聊图片）→ 自动进入识图会话"""
-        if event.is_stopped() or self._is_self_message(event):
+        if (
+            event.is_stopped()
+            or self._is_self_message(event)
+            or self._is_command_message(event)
+        ):
             return
 
         images = await self._collect_images(event)
@@ -174,7 +178,7 @@ class CloakSearchPlugin(Star):
         """@机器人（或私聊）发送文本 → 自动进入 AI 搜索对话，无需 /ais 指令。
 
         仅在需要切换/新建会话时才使用 /ais switch、/ais new 等指令。
-        跳过：指令消息（/ 开头或 AstrBot 识别为指令）、图片消息（交给识图）、
+        跳过：指令消息（AstrBot 指令 filter 已激活的消息）、图片消息（交给识图）、
         机器人自己发出的消息（部分平台会回传，防止自我回复循环）。
         """
         if not AUTO_TRIGGER or event.is_stopped() or self._is_self_message(event):
@@ -183,7 +187,7 @@ class CloakSearchPlugin(Star):
         text = self._clean_image_text(event.get_message_str() or "")
         if not text:
             return
-        if text.startswith("/"):
+        if text.startswith("/") or self._is_command_message(event):
             return  # 指令消息（/ais、/cloak登录 等）由对应指令处理器处理
         if await self._collect_images(event):
             return  # 图片消息交给 on_image_message（识图模式）
@@ -261,6 +265,30 @@ class CloakSearchPlugin(Star):
             return bool(sender) and sender == self_id
         except Exception:
             return False
+
+    @staticmethod
+    def _is_command_message(event: AstrMessageEvent) -> bool:
+        """判断消息是否被 AstrBot 识别为某插件的指令（含内置指令）。
+
+        关键背景：waking_check 阶段已将 wake_prefix（默认 /）从
+        message_str 剥离（"/cloak登录" 到达插件时已是 "cloak登录"），
+        因此不能靠文本前缀判断指令。改用 activated_handlers——
+        AstrBot 在唤醒检查时已把匹配的指令 handler 写入事件，
+        其中带 Command 类 filter（CommandFilter / CommandGroupFilter）。
+
+        必须让路的原因：自动触发若误拦截指令消息并 stop_event()，
+        StarRequestSubStage 会因 is_stopped 跳过后续所有 handler，
+        导致 /cloak登录、/ais 等指令彻底失效。
+        """
+        try:
+            activated = event.get_extra("activated_handlers", []) or []
+            for handler in activated:
+                for f in getattr(handler, "event_filters", []) or []:
+                    if "Command" in type(f).__name__:
+                        return True
+        except Exception:
+            pass
+        return False
 
     # ═════════════════════ 图片工具 ═════════════════════
 

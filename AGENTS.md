@@ -1,7 +1,7 @@
 # astrbot_plugin_aisearch 开发文档
 
 > **插件名称**：AI搜索  
-> **版本**：v2.2.2  
+> **版本**：v2.2.3  
 > **作者**：Roi  
 > **许可证**：AGPL-3.0  
 > **仓库地址**：https://github.com/Roi7687/astrbot_plugin_aisearch  
@@ -25,6 +25,8 @@
 **v2.2.1 变更**：修复慢速网络下识图「文本已发送但图片未上传完」导致 AI 识别不到图片的问题——上传等待从「blob 缩略图出现」升级为**双路上传完成确认**（① 监听上传网络请求 POST/PUT 含 upload/file 全部响应；② DOM 上传中标志消失兜底），确认完成才发送提问；同时**生成完成确认**——文本稳定后还需页面无「生成中」标志（停止按钮/流式光标/思考中指示，排除回答正文与隐藏元素）才返回结果，避免深度思考/长回答中间停顿 >9s 时提前返回半截答案；总等待上限放宽至 300 秒。
 
 **v2.2.2 变更**：**减少冗余通知/防刷屏**——① 取消会话空闲超时的主动推送通知（`_notify` / `_record_notice_source` / `_notice_sources` 全部移除，超时静默销毁，仅留日志）；② 自动触发/识图处理器新增**自我消息过滤**（`_is_self_message`：`get_sender_id() == get_self_id()` 时跳过），防止部分平台回传机器人自身消息导致自我回复循环刷屏。
+
+**v2.2.3 变更**：**修复自动触发拦截指令**——AstrBot 的 waking_check 阶段会把指令前缀（默认 `/`）从 `message_str` 剥离（`/cloak登录` 到达插件时已是 `cloak登录`），导致 `on_auto_message` 的 `startswith("/")` 检查失效：指令文本被当作提问发送给 DeepSeek（报「未检测到登录凭证」），且 `stop_event()` 会阻断后续指令 handler（`StarRequestSubStage` 遇 `is_stopped` 即 break），`/cloak登录`、`/ais` 等指令全部失效。新增 `_is_command_message`：检查 `event.get_extra("activated_handlers")` 中是否存在带 Command 类 filter（CommandFilter / CommandGroupFilter，含其他插件与内置指令）的 handler，命中即让路。
 
 ---
 
@@ -129,6 +131,7 @@ astrbot_plugin_aisearch/
 | `_respond()` | 统一回复：刷新空闲计时 + 「已开启新会话」前缀 + 键盘按钮；返回空串表示已发送 |
 | `_arm_idle_timer()` / `_idle_waiter()` | 每会话独立空闲计时器，超时**静默销毁**（不推送通知，避免刷屏） |
 | `_is_self_message()` | 跳过机器人自己发出的消息（部分平台会回传自身消息，防止自我回复循环） |
+| `_is_command_message()` | 跳过被 AstrBot 识别为指令的消息（waking_check 已剥离指令前缀，无法靠文本判断；检查 activated_handlers 中带 Command 类 filter 的 handler），防止自动触发拦截 /cloak登录、/ais 等指令 |
 | `_collect_images()` | 兼容新旧 AstrBot API 提取图片组件 |
 | `_prepare_image_paths()` | 图片 → 本地路径（自动下载、PIL 压缩） |
 | `_build_keyboard()` / `_try_send_with_keyboard()` | QQ 官方平台键盘按钮消息（其余平台自动回退纯文本） |
@@ -149,9 +152,10 @@ astrbot_plugin_aisearch/
 | `/ais help`（帮助） | 帮助 |
 | `/cloak登录` | 微信扫码登录 |
 
-**防刷屏策略（v2.2.2）**：
+**防刷屏与指令保护策略**：
 - 会话空闲超时**静默销毁**，不推送任何主动通知（此前每会话超时都会向聊天窗口推送一条）
 - 自动触发 / 识图处理器跳过机器人自己发出的消息（`sender_id == self_id`），防止自我回复循环
+- 自动触发 / 识图处理器跳过**指令消息**（`_is_command_message`：activated_handlers 含 Command 类 filter 即让路；waking_check 已剥离指令前缀，不能靠文本判断），避免拦截 /cloak登录、/ais 及其他插件/内置指令
 - 回复只跟随用户提问产生（指令 / 自动触发 / 识图各一条），QQ 官方平台键盘按钮与回复合并为一条消息
 
 ### 3.5 `core/login_core.py` — 登录模块
@@ -184,7 +188,8 @@ astrbot_plugin_aisearch/
        ▼
   on_auto_message()（EventMessageType.ALL）
        ├─ AUTO_TRIGGER 关闭 / 事件已停止 / 机器人自身消息 → 返回
-       ├─ 空文本 / 以 / 开头（指令） → 返回
+       ├─ 空文本 → 返回
+       ├─ 指令消息（文本以 / 开头，或 activated_handlers 含 Command 类 filter）→ 返回，交给指令处理器
        ├─ 含图片 → 返回（交给 on_image_message 识图）
        ├─ 群聊未@未唤醒 → 返回（不拦截正常聊天）
        └─ 命中 → event.stop_event()（阻止默认 LLM 响应）
@@ -314,6 +319,12 @@ astrbot_plugin_aisearch/
 | 取消超时主动通知 | ✅ | 会话空闲超时静默销毁（仅日志），`_notify` / `_record_notice_source` / `_notice_sources` 全部移除 |
 | 自我消息过滤 | ✅ | `_is_self_message`（sender_id == self_id）应用于自动触发与识图处理器，防自我回复循环刷屏 |
 
+### ✅ v2.2.3 已完成功能
+
+| 功能 | 状态 | 说明 |
+|------|------|------|
+| 修复自动触发拦截指令 | ✅ | `_is_command_message`：检查 activated_handlers 中带 Command 类 filter 的 handler（含其他插件/内置指令），命中即让路；修复 /cloak登录、/ais 等指令因指令前缀被 waking_check 剥离而被误当提问 + stop_event 阻断的问题 |
+
 ### ⚠️ 已知问题 / 待改进
 
 - **UI 依赖**：识图模式入口、上传输入框等选择器基于 2026-06 上线的 DeepSeek 网页版 UI，改版后需更新 `session_core.py`
@@ -343,4 +354,4 @@ astrbot_plugin_aisearch/
 
 ---
 
-*文档更新日期：2026-08-29（v2.2.2）*
+*文档更新日期：2026-08-29（v2.2.3）*
