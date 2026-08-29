@@ -5,6 +5,11 @@ PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATE_FILE = os.path.join(PLUGIN_DIR, "auth_state.json")
 QR_FILE = os.path.join(PLUGIN_DIR, "qrcode.png")
 CONVERSATIONS_FILE = os.path.join(PLUGIN_DIR, "conversations.json")
+VISION_DEBUG_SHOT = os.path.join(PLUGIN_DIR, "vision_debug.png")  # 识图入口查找失败时的调试截图
+
+# ── 浏览器语言/时区（强制中文 UI，避免 Linux 等英文系统下 DeepSeek 返回英文界面导致文本匹配失败）──
+BROWSER_LOCALE = "zh-CN"
+BROWSER_TIMEZONE = "Asia/Shanghai"
 
 # ── 会话行为配置 ──
 IDLE_TIMEOUT_SECONDS = 300  # 会话无活动自动销毁（秒），修改后需重启插件生效

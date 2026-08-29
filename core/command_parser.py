@@ -1,21 +1,23 @@
 """/ais 指令参数解析器（纯函数，不依赖 astrbot，便于单元测试）。
 
 /ais 用法：
-  /ais <问题>                 在当前会话提问（无会话则自动创建普通会话）
-  /ais -t <问题>              开启深度思考
-  /ais -v <问题>              切到识图会话并提问（无识图会话则自动创建）
-  /ais -v -t <问题>           识图会话 + 深度思考
-  /ais new | reset | 重置     关闭当前会话并开启新会话（同模式）
-  /ais session | 状态         查看当前会话信息
-  /ais list | 列表            查看全部会话
-  /ais switch [模式] | 切换    切换当前会话（可指定 识图/普通，缺省列出可选模式）
-  /ais help | 帮助            查看帮助
+  /ais <问题>                     在当前会话提问（无会话则自动创建普通会话）
+  /ais -t <问题>                  开启深度思考
+  /ais -v <问题>                  切到识图会话并提问（无识图会话则自动创建）
+  /ais -v -t <问题>               识图会话 + 深度思考
+  /ais new | reset | 重置         开启新会话（旧会话保留，可按 id 切回）
+  /ais list | 列表 | 状态 | session   查看全部会话（带本地 id）
+  /ais list <id>                  按本地 id 直接切换（便捷写法）
+  /ais switch <id> | <识图/普通>   切换会话（按本地 id 或模式）
+  /ais switch                     无参数 = 显示会话列表
+  /ais help | 帮助                查看帮助
 """
 
 SUBCOMMAND_ALIASES = {
     "new": "new", "reset": "new", "重置": "new", "新会话": "new", "重新开始": "new",
-    "session": "session", "状态": "session", "会话": "session", "info": "session",
+    # session/状态 已合并进 list（统一查看/切换入口）
     "list": "list", "列表": "list", "会话列表": "list", "sessions": "list",
+    "session": "list", "状态": "list", "会话": "list", "info": "list", "查看": "list",
     "switch": "switch", "切换": "switch",
     "help": "help", "帮助": "help", "帮助文档": "help",
 }
@@ -24,9 +26,6 @@ MODE_ALIASES = {
     "vision": "vision", "识图": "vision", "图片": "vision", "图像": "vision", "v": "vision",
     "normal": "normal", "普通": "normal", "文本": "normal", "对话": "normal", "n": "normal",
 }
-
-# 独立子命令时不允许带模式参数的命令
-SWITCHABLE_MODES = ("vision", "normal")
 
 
 def _strip_flags(tokens):
@@ -47,14 +46,29 @@ def _strip_flags(tokens):
     return thinking, vision, rest
 
 
+def _parse_switch_target(tokens):
+    """解析 switch/list 的目标参数：本地 id 或模式别名。
+
+    返回 {"local_id": int} / {"mode": str} / {}（无有效目标）
+    """
+    if len(tokens) < 2:
+        return {}
+    cand = tokens[1].lower()
+    if cand.isdigit():
+        return {"local_id": int(cand)}
+    if cand in MODE_ALIASES:
+        return {"mode": MODE_ALIASES[cand]}
+    return {}
+
+
 def parse_ais_command(raw: str):
     """解析 /ais 后的参数。
 
     返回 (action, payload)：
-      action: "usage" | "help" | "send" | "new" | "session" | "list" | "switch"
+      action: "usage" | "help" | "send" | "new" | "list" | "switch"
       payload: dict
-        - send:    {"mode": "normal"|"vision"|None, "thinking": bool, "text": str}
-        - switch:  {"mode_arg": str|None}
+        - send:    {"mode": "vision"|None, "thinking": bool, "text": str}
+        - switch:  {"local_id": int} | {"mode": str} | {}
         - 其余:    {}
     """
     q = (raw or "").strip()
@@ -67,8 +81,6 @@ def parse_ais_command(raw: str):
 
     # 无正文且只有旗标
     if not rest:
-        if thinking or vision:
-            return "usage", {}
         return "usage", {}
 
     # 子命令：只有第一个 token 是关键词才识别（避免误伤正常提问）
@@ -79,18 +91,15 @@ def parse_ais_command(raw: str):
             return "help", {}
         if action == "new":
             return "new", {}
-        if action == "session":
-            return "session", {}
         if action == "list":
+            # /ais list [id | 识图/普通]：无参显示列表；带有效目标直接切换
+            target = _parse_switch_target(rest_tokens)
+            if target:
+                return "switch", target
             return "list", {}
         if action == "switch":
-            # switch [模式]
-            mode_arg = None
-            if len(rest_tokens) > 1:
-                cand = rest_tokens[1].lower()
-                if cand in MODE_ALIASES:
-                    mode_arg = MODE_ALIASES[cand]
-            return "switch", {"mode_arg": mode_arg}
+            # /ais switch [id | 识图/普通]：无参或参数无效时由调用方显示列表
+            return "switch", _parse_switch_target(rest_tokens)
         # 兜底
         return action, {}
 

@@ -1,12 +1,12 @@
 """统一持久化会话核心。
 
 设计：
-- 常驻一个反检测浏览器（cloakbrowser），内部维护最多两个会话槽位：
-    普通对话（normal）与识图对话（vision）。
-- 每个槽位：惰性创建（首次使用时）、空闲超时自动销毁（服务器端删除会话）、
-  可手动重置（关闭旧会话开启新会话）、可随时切换。
+- 常驻一个反检测浏览器（cloakbrowser），本地维护多个会话记录（普通/识图混合），
+  每个会话有一个本地递增 id（1、2、3...），可随时列出（/ais list）与按 id 切换（/ais switch <id>）。
+- 会话惰性创建（首次使用时）；空闲超时自动销毁（服务器端删除会话）；
+  已销毁会话保留记录，按 id 切换时自动重建。
 - 所有页面操作通过 asyncio.Lock 串行化，避免并发命令互相干扰。
-- 会话元数据持久化到 conversations.json，插件重启后仍可切换回未销毁的会话。
+- 会话元数据持久化到 conversations.json（含 id 计数器），插件重启后仍可切回未销毁的会话。
 """
 
 import asyncio
@@ -21,15 +21,19 @@ from markdownify import markdownify as md
 from cloakbrowser import launch_async
 
 from .config import (
+    BROWSER_LOCALE,
+    BROWSER_TIMEZONE,
     CONVERSATIONS_FILE,
     DEEPSEEK_BASE,
     DEFAULT_VISION_PROMPT,
     IDLE_TIMEOUT_SECONDS,
     MODE_LABELS,
+    MODES,
     MODE_NORMAL,
     MODE_VISION,
     MAX_IMAGE_BYTES,
     STATE_FILE,
+    VISION_DEBUG_SHOT,
     VISION_WELCOME_TEXT,
     AuthError,
     ConversationError,
@@ -41,17 +45,25 @@ logger = logging.getLogger("astrbot")
 STABLE_CHECKS = 18      # 连续 N 次文本无变化视为输出完成
 STABLE_INTERVAL = 0.5   # 每次检测间隔（秒）
 
+# 识图模式入口标签：中文正常命中；英文兜底（服务器为英文系统且语言强制失败时 UI 为英文）
+VISION_ENTRY_LABELS = ("识图模式", "Image Mode", "Vision Mode", "Image Recognition")
+# 模糊匹配关键词（部分改版入口带描述文字，如「识图模式 · 实验性」）
+VISION_ENTRY_FUZZY = ("识图",)
+# 可能收纳模式入口的「+ / 更多」菜单按钮文本（窄视口/改版下入口在弹出菜单里）
+VISION_EXPAND_LABELS = ("更多", "More", "+", "＋")
+
 
 @dataclass
 class Conversation:
-    """单个 DeepSeek 会话槽位的元数据"""
-    mode: str                       # normal | vision
+    """单个 DeepSeek 会话的元数据（local_id 由插件本地计数）"""
+    local_id: int = 0               # 本地会话 id（1, 2, 3...）
+    mode: str = MODE_NORMAL         # normal | vision
     session_id: str = ""
     url: str = ""                   # 会话页面 URL（用于切换回来）
     message_count: int = 0          # 用户已发送消息数
     created_at: float = 0.0
     last_active: float = 0.0
-    destroyed: bool = False         # True 表示已销毁（超时/重置），下次使用需重建
+    destroyed: bool = False         # True 表示已销毁（超时），按 id 切换时会重建
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -63,7 +75,7 @@ class Conversation:
 
 
 class DeepSeekSessionCore:
-    """统一持久化会话核心（全异步）"""
+    """统一持久化会话核心（全异步，多会话 + 本地 id）"""
 
     def __init__(self):
         self.browser = None
@@ -71,98 +83,154 @@ class DeepSeekSessionCore:
         self.page = None
         self.bearer_token = None
         self.lock = asyncio.Lock()      # 串行化所有页面操作
-        self.conversations: dict[str, Conversation] = {}
-        self.current_mode = MODE_NORMAL
+        self.conversations: dict[int, Conversation] = {}  # local_id -> 会话
+        self.next_id = 1                # 本地会话 id 计数器
+        self.current_id: int | None = None   # 当前会话 id
         self._closing = False
         self._load_conversations()
 
     # ───────────────────────── 对外 API ─────────────────────────
 
-    async def send_message(self, mode: str, text: str, thinking: bool = False) -> str:
-        """在指定模式的会话中发送文本消息（无会话则自动创建）"""
+    @property
+    def current_conversation(self) -> Conversation | None:
+        """当前会话（可能为 None）"""
+        if self.current_id is None:
+            return None
+        return self.conversations.get(self.current_id)
+
+    @property
+    def current_mode(self) -> str:
+        """当前会话模式（无会话时为 normal）"""
+        conv = self.current_conversation
+        return conv.mode if conv else MODE_NORMAL
+
+    async def send_message(
+        self, text: str, thinking: bool = False, mode: str | None = None
+    ) -> tuple[bool, str]:
+        """在当前会话（或指定模式会话）发送文本消息。
+
+        mode=None 保持当前会话（无会话自动创建普通会话）；
+        mode='vision' 会复用最近的识图会话（无则新建）。
+        返回 (是否新建了会话, 回答文本)。
+        """
         async with self.lock:
             self._check_closing()
-            conv = await self.ensure_conversation_locked(mode)
+            conv, created = await self.ensure_current_locked(mode)
             result = await self._send_query(text, thinking)
             self._mark_active(conv)
-            return result
+            return created, result
 
     async def send_image_message(
-        self, mode: str, text: str, image_paths: list, thinking: bool = False
-    ) -> str:
-        """在识图会话中发送图片（可附带文字）"""
+        self, text: str, image_paths: list, thinking: bool = False
+    ) -> tuple[bool, str]:
+        """在识图会话中发送图片（可附带文字）。返回 (是否新建了会话, 回答文本)"""
         async with self.lock:
             self._check_closing()
-            conv = await self.ensure_conversation_locked(mode)
+            conv, created = await self.ensure_current_locked(MODE_VISION)
             await self._upload_images(image_paths)
             result = await self._send_query(text or DEFAULT_VISION_PROMPT, thinking)
             self._mark_active(conv)
-            return result
+            return created, result
 
-    async def ensure_conversation(self, mode: str) -> Conversation:
-        """确保指定模式的会话存在（创建或切换到它）"""
+    async def ensure_mode(self, mode: str) -> tuple[Conversation, bool]:
+        """确保当前会话为指定模式：复用该模式最近活跃会话，没有则新建。
+        返回 (会话, 是否新建)。"""
         async with self.lock:
             self._check_closing()
-            return await self.ensure_conversation_locked(mode)
+            return await self.ensure_current_locked(mode)
 
-    async def switch_conversation(self, mode: str) -> Conversation:
-        """切换到指定模式的会话（不存在则创建）"""
+    async def switch_conversation(self, local_id: int) -> tuple[Conversation, bool]:
+        """按本地 id 切换会话；id 不存在报错，已销毁则同模式重建。
+        返回 (会话, 是否重建了会话)。"""
         async with self.lock:
             self._check_closing()
-            conv = await self.ensure_conversation_locked(mode)
-            self.current_mode = mode
-            logger.info(f"🔀 [Session] 已切换到{MODE_LABELS.get(mode, mode)}。")
+            conv = self.conversations.get(local_id)
+            if not conv:
+                raise ConversationError(
+                    f"找不到会话 #{local_id}，请先发送 /ais list 查看可用会话。"
+                )
+            if conv.destroyed:
+                new_conv = await self._create_conversation(conv.mode)
+                new_conv.local_id = conv.local_id
+                new_conv.created_at = conv.created_at
+                self.conversations[local_id] = new_conv
+                self.current_id = local_id
+                self._save_conversations()
+                logger.info(
+                    f"🔀 [Session] 会话 #{local_id} 已关闭，已重建新的{MODE_LABELS.get(conv.mode, conv.mode)}。"
+                )
+                return new_conv, True
+            try:
+                await self._goto_session(conv)
+            except ConversationError:
+                logger.warning(f"⚠️ [Session] 会话 #{local_id} 页面已失效，自动重建...")
+                conv.destroyed = True
+                new_conv = await self._create_conversation(conv.mode)
+                new_conv.local_id = conv.local_id
+                new_conv.created_at = conv.created_at
+                self.conversations[local_id] = new_conv
+                self.current_id = local_id
+                self._save_conversations()
+                return new_conv, True
+            self.current_id = local_id
+            self._save_conversations()
+            return conv, False
+
+    async def new_conversation(self, mode: str | None = None) -> Conversation:
+        """创建新会话并设为当前（mode 缺省沿用当前会话模式）。
+        旧会话保留在列表中，可按 id 切回。"""
+        async with self.lock:
+            self._check_closing()
+            mode = mode or self.current_mode
+            conv = await self._create_conversation(mode)
+            self._register(conv)
             return conv
 
-    async def reset_conversation(self, mode: str) -> Conversation:
-        """重置：关闭旧会话（服务器端删除）并开启同一模式的新会话"""
+    async def destroy_conversation(self, local_id: int) -> bool:
+        """销毁指定会话（空闲超时调用）。返回是否真的有会话被销毁"""
         async with self.lock:
-            self._check_closing()
-            old = self.conversations.get(mode)
-            if old and not old.destroyed:
-                await self._delete_session_best_effort(old)
-                old.destroyed = True
-                logger.info(f"🔄 [Session] 已关闭旧的{MODE_LABELS.get(mode, mode)}。")
-            conv = await self.ensure_conversation_locked(mode)
-            self.current_mode = mode
-            return conv
-
-    async def destroy_conversation(self, mode: str) -> bool:
-        """销毁指定模式的会话（空闲超时调用）。返回是否真的有会话被销毁"""
-        async with self.lock:
-            conv = self.conversations.get(mode)
+            conv = self.conversations.get(local_id)
             if not conv or conv.destroyed:
                 return False
             await self._delete_session_best_effort(conv)
             conv.destroyed = True
             self._save_conversations()
-            logger.info(f"⏳ [Session] {MODE_LABELS.get(mode, mode)}已销毁。")
+            logger.info(
+                f"⏳ [Session] 会话 #{local_id}（{MODE_LABELS.get(conv.mode, conv.mode)}）已销毁。"
+            )
             return True
 
-    def get_conversation(self, mode: str) -> Conversation | None:
-        return self.conversations.get(mode)
+    def get_conversation(self, local_id: int) -> Conversation | None:
+        return self.conversations.get(local_id)
 
-    def conversation_summary(self, mode: str) -> dict:
-        """供 /ais session 使用"""
-        conv = self.conversations.get(mode)
+    def conversation_summary(self, local_id: int) -> dict:
+        """单个会话摘要（供 /ais list 使用）"""
+        conv = self.conversations.get(local_id)
         now = time.time()
-        if not conv or conv.destroyed:
-            return {"mode": mode, "label": MODE_LABELS.get(mode, mode), "exists": False}
-        remain = max(0, int(IDLE_TIMEOUT_SECONDS - (now - conv.last_active)))
+        if not conv:
+            return {"local_id": local_id, "exists": False}
+        remain = (
+            0
+            if conv.destroyed
+            else max(0, int(IDLE_TIMEOUT_SECONDS - (now - conv.last_active)))
+        )
         return {
-            "mode": mode,
-            "label": MODE_LABELS.get(mode, mode),
+            "local_id": local_id,
+            "mode": conv.mode,
+            "label": MODE_LABELS.get(conv.mode, conv.mode),
             "exists": True,
+            "destroyed": conv.destroyed,
             "session_id": conv.session_id or "未知",
             "message_count": conv.message_count,
             "created_at": time.strftime("%m-%d %H:%M", time.localtime(conv.created_at)),
             "last_active": time.strftime("%m-%d %H:%M", time.localtime(conv.last_active)),
             "idle_remain": remain,
-            "is_current": (mode == self.current_mode),
+            "is_current": (local_id == self.current_id),
         }
 
     def list_summary(self) -> list[dict]:
-        return [self.conversation_summary(m) for m in (MODE_NORMAL, MODE_VISION)]
+        """全部会话摘要（按本地 id 升序）"""
+        return [self.conversation_summary(i) for i in sorted(self.conversations)]
 
     def is_browser_alive(self) -> bool:
         return self.browser is not None
@@ -189,29 +257,82 @@ class DeepSeekSessionCore:
         if self._closing:
             raise ConversationError("会话正在关闭中，请稍后重试")
 
+    def _register(self, conv: Conversation):
+        """为新会话分配本地 id 并登记为当前会话"""
+        conv.local_id = self.next_id
+        self.next_id += 1
+        self.conversations[conv.local_id] = conv
+        self.current_id = conv.local_id
+        self._save_conversations()
+        logger.info(
+            f"🟢 [Session] 已创建会话 #{conv.local_id}（{MODE_LABELS.get(conv.mode, conv.mode)}）。"
+        )
+
+    def _latest_of_mode(self, mode: str, alive_only: bool = True) -> Conversation | None:
+        """返回指定模式最近活跃的会话（alive_only=True 时排除已销毁）"""
+        cands = [c for c in self.conversations.values() if c.mode == mode]
+        if alive_only:
+            cands = [c for c in cands if not c.destroyed]
+        return max(cands, key=lambda c: c.last_active) if cands else None
+
     def _load_conversations(self):
         try:
-            if os.path.exists(CONVERSATIONS_FILE):
-                with open(CONVERSATIONS_FILE, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                for mode, d in data.items():
-                    if mode in (MODE_NORMAL, MODE_VISION):
-                        self.conversations[mode] = Conversation.from_dict(d)
-                logger.info(f"📂 [Session] 已加载会话元数据: {len(self.conversations)} 个槽位")
+            if not os.path.exists(CONVERSATIONS_FILE):
+                return
+            with open(CONVERSATIONS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict) and "conversations" in data:
+                # 新格式：{"next_id": N, "current_id": id, "conversations": {id: {...}}}
+                self.next_id = int(data.get("next_id") or 1)
+                self.current_id = data.get("current_id")
+                for k, d in data["conversations"].items():
+                    conv = Conversation.from_dict(d)
+                    if conv.local_id:
+                        self.conversations[conv.local_id] = conv
+            elif isinstance(data, dict):
+                # 旧格式 {"normal": {...}, "vision": {...}}：迁移为本地 id（normal=1, vision=2）
+                for mode in MODES:
+                    if mode in data:
+                        conv = Conversation.from_dict(
+                            {**data[mode], "local_id": self.next_id}
+                        )
+                        self.conversations[self.next_id] = conv
+                        self.next_id += 1
+                alive = [c for c in self.conversations.values() if not c.destroyed]
+                if alive:
+                    self.current_id = max(alive, key=lambda c: c.last_active).local_id
+                if self.conversations:
+                    logger.info("📂 [Session] 已迁移旧版双槽位会话数据为本地 id 索引。")
+            if self.current_id not in self.conversations:
+                self.current_id = None
+            logger.info(
+                f"📂 [Session] 已加载会话元数据: {len(self.conversations)} 个会话（下一个 id={self.next_id}）"
+            )
         except Exception as e:
             logger.warning(f"⚠️ [Session] 加载会话元数据失败: {e}")
 
     def _save_conversations(self):
         try:
             with open(CONVERSATIONS_FILE, "w", encoding="utf-8") as f:
-                json.dump({m: c.to_dict() for m, c in self.conversations.items()}, f, ensure_ascii=False, indent=2)
+                json.dump(
+                    {
+                        "next_id": self.next_id,
+                        "current_id": self.current_id,
+                        "conversations": {
+                            str(k): c.to_dict() for k, c in self.conversations.items()
+                        },
+                    },
+                    f,
+                    ensure_ascii=False,
+                    indent=2,
+                )
         except Exception as e:
             logger.warning(f"⚠️ [Session] 保存会话元数据失败: {e}")
 
     def _mark_active(self, conv: Conversation):
         conv.message_count += 1
         conv.last_active = time.time()
-        self.current_mode = conv.mode
+        self.current_id = conv.local_id
         # 发送后页面 URL 会更新为真实会话地址（/a/chat/s/<uuid>），回写记录
         try:
             url = self.page.url if self.page else ""
@@ -224,25 +345,38 @@ class DeepSeekSessionCore:
             pass
         self._save_conversations()
 
-    async def ensure_conversation_locked(self, mode: str) -> Conversation:
-        """（持锁调用）确保会话存在并让页面处于该会话"""
-        conv = self.conversations.get(mode)
-        if not conv or conv.destroyed or not conv.url:
+    async def ensure_current_locked(self, mode: str | None = None) -> tuple[Conversation, bool]:
+        """（持锁调用）确保当前会话就绪：返回 (会话, 是否新建)"""
+        conv = self.current_conversation
+        if conv and not conv.destroyed and (mode is None or conv.mode == mode):
+            # 当前会话模式匹配（或无需指定）：导航回其页面，失效则重建
+            try:
+                await self._goto_session(conv)
+                return conv, False
+            except ConversationError:
+                logger.warning(f"⚠️ [Session] 会话 #{conv.local_id} 页面已失效，自动重建...")
+                conv.destroyed = True
+                self._save_conversations()
+        if mode is not None:
+            # 指定模式：复用该模式最近活跃会话
+            cand = self._latest_of_mode(mode)
+            if cand:
+                try:
+                    await self._goto_session(cand)
+                    self.current_id = cand.local_id
+                    self._save_conversations()
+                    return cand, False
+                except ConversationError:
+                    logger.warning(f"⚠️ [Session] 会话 #{cand.local_id} 页面已失效，自动重建...")
+                    cand.destroyed = True
+                    self._save_conversations()
             conv = await self._create_conversation(mode)
-            self.conversations[mode] = conv
-            self._save_conversations()
-            return conv
-        # 会话已存在：导航回其页面；页面失效则自动重建
-        try:
-            await self._goto_session(conv)
-        except ConversationError:
-            logger.warning(f"⚠️ [Session] {MODE_LABELS.get(mode, mode)}页面已失效，自动重建...")
-            conv.destroyed = True
-            conv = await self._create_conversation(mode)
-            self.conversations[mode] = conv
-            self._save_conversations()
-        self.current_mode = mode
-        return conv
+            self._register(conv)
+            return conv, True
+        # 无当前会话：创建普通会话
+        conv = await self._create_conversation(MODE_NORMAL)
+        self._register(conv)
+        return conv, True
 
     async def _init_browser(self):
         """按需初始化浏览器"""
@@ -250,8 +384,19 @@ class DeepSeekSessionCore:
             raise AuthError("本地未找到登录凭证。")
 
         logger.info("🚀 [Session] 正在启动持久化搜索内核...")
-        self.browser = await launch_async(headless=True, humanize=True)
-        self.context = await self.browser.new_context(storage_state=STATE_FILE)
+        # 强制中文 UI：不指定 locale 时浏览器继承服务器系统语言（Linux 多为英文），
+        # DeepSeek 会返回英文界面，「识图模式」等中文文本匹配将全部失败
+        self.browser = await launch_async(
+            headless=True,
+            humanize=True,
+            locale=BROWSER_LOCALE,
+            timezone=BROWSER_TIMEZONE,
+        )
+        self.context = await self.browser.new_context(
+            storage_state=STATE_FILE,
+            locale=BROWSER_LOCALE,
+            timezone_id=BROWSER_TIMEZONE,
+        )
         self.page = await self.context.new_page()
         self.page.set_default_timeout(30000)
 
@@ -263,7 +408,7 @@ class DeepSeekSessionCore:
         self.page.on("request", sniff_auth_token)
 
     async def _create_conversation(self, mode: str) -> Conversation:
-        """开启新模式的新会话（识图模式需点击模式入口）"""
+        """开启指定模式的新会话（识图模式需点击模式入口）。id 由 _register 分配"""
         if not self.browser:
             await self._init_browser()
 
@@ -274,7 +419,6 @@ class DeepSeekSessionCore:
         conv = Conversation(mode=mode, created_at=time.time(), last_active=time.time())
         conv.url = self.page.url
         conv.session_id = self._extract_session_id(self.page.url)
-        logger.info(f"🟢 [Session] 已创建{MODE_LABELS.get(mode, mode)}（url={conv.url}）。")
         return conv
 
     async def _open_new_chat(self):
@@ -295,6 +439,14 @@ class DeepSeekSessionCore:
         except Exception:
             pass
 
+        # 等待输入框出现，确保聊天页真正可用（慢速服务器/弱网下更稳妥）
+        try:
+            await self.page.locator("textarea").first.wait_for(
+                state="visible", timeout=30000
+            )
+        except Exception:
+            logger.warning("⚠️ [Session] 新对话页输入框未出现，继续尝试...")
+
         # 若当前不是空白新对话（有历史消息），点击「开启新对话」
         has_messages = await self.page.evaluate(
             "() => document.querySelectorAll('.ds-markdown').length > 0"
@@ -305,7 +457,7 @@ class DeepSeekSessionCore:
                     const nodes = [...document.querySelectorAll('div,span,button,[role=button]')];
                     for (const e of nodes) {
                         const x = (e.innerText || '').trim();
-                        if ((x === '开启新对话' || x === '新建对话') && e.children.length === 0) {
+                        if ((x === '开启新对话' || x === '新建对话' || x === 'New chat' || x === 'New Chat') && e.children.length === 0) {
                             e.click();
                             return 'clicked';
                         }
@@ -318,50 +470,141 @@ class DeepSeekSessionCore:
             await asyncio.sleep(2)
 
     async def _switch_to_vision(self):
-        """点击「识图模式」入口并验证切换成功"""
-        in_vision = await self.page.evaluate(
+        """点击「识图模式」入口并验证切换成功。
+
+        多策略查找：精确标签（中/英）→ 模糊文本 → 展开「+ / 更多」菜单；
+        全部失败时保存页面截图与文本片段留档，便于排查 UI 变化。
+        """
+        if await self._in_vision_state():
+            return
+
+        for attempt in range(3):
+            clicked = await self._click_vision_entry()
+            if clicked == "clicked":
+                await asyncio.sleep(1)
+                if await self._in_vision_state():
+                    return
+                continue
+            # 未找到入口：第一次先尝试展开「+ / 更多」菜单（窄视口/改版下入口在弹出菜单里）
+            if attempt == 0:
+                expanded = await self._expand_vision_menu()
+                if expanded:
+                    logger.info("🔎 [Session] 已展开「更多」菜单，重新查找识图模式入口...")
+                    await asyncio.sleep(1.2)
+                    continue
+            # 三次都找不到（慢速服务器页面未渲染完也会在这里兜住）才留档报错
+            if attempt == 2:
+                await self._dump_vision_failure()
+                raise ConversationError(
+                    "未找到「识图模式」入口。可能当前账号未开放识图功能、网页 UI 已更新，"
+                    "或浏览器被识别为英文环境（已自动尝试中文/英文入口与「更多」菜单）。"
+                    "已保存页面截图 vision_debug.png 到插件目录，请查看后反馈。"
+                )
+        raise ConversationError("「识图模式」切换失败，请稍后重试。")
+
+    async def _in_vision_state(self) -> bool:
+        """判断当前页面是否已处于识图模式：欢迎语出现，或入口元素处于激活态"""
+        return await self.page.evaluate(
             """() => {
                 const t = document.body.innerText || '';
                 if (t.indexOf(%s) >= 0) return true;
+                const labels = %s;
                 for (const e of document.querySelectorAll('div,span,button')) {
                     const x = (e.innerText || '').trim();
-                    if (x === '识图模式') {
+                    if (labels.indexOf(x) >= 0) {
                         const c = '' + e.className;
                         if (c.indexOf('active') >= 0 || c.indexOf('selected') >= 0 ||
                             e.getAttribute('aria-selected') === 'true') return true;
                     }
                 }
                 return false;
-            }""" % json.dumps(VISION_WELCOME_TEXT)
+            }""" % (
+                json.dumps(VISION_WELCOME_TEXT),
+                json.dumps(list(VISION_ENTRY_LABELS)),
+            )
         )
-        if in_vision:
-            return
 
-        for attempt in range(3):
-            clicked = await self.page.evaluate(
-                """() => {
-                    const nodes = [...document.querySelectorAll('div,span,button')];
-                    for (const e of nodes) {
-                        const x = (e.innerText || '').trim();
-                        if (x === '识图模式' && e.children.length === 0) {
-                            e.click();
-                            return 'clicked';
-                        }
+    async def _click_vision_entry(self) -> str:
+        """查找并点击识图模式入口（精确标签优先，模糊文本兜底）。返回 'clicked' / 'not_found'"""
+        return await self.page.evaluate(
+            """() => {
+                const exact = %s, fuzzy = %s;
+                // 在候选元素中挑「最深」（children 最少）且文本最短的叶节点，避免点中父容器
+                const pick = (pred) => {
+                    let best = null;
+                    for (const e of document.querySelectorAll('div,span,button,[role=button]')) {
+                        if (!pred(e)) continue;
+                        if (!best) { best = e; continue; }
+                        const leaf = e.children.length === 0;
+                        const bestLeaf = best.children.length === 0;
+                        if (leaf && !bestLeaf) best = e;
+                        else if (leaf === bestLeaf &&
+                                 (e.innerText || '').length < (best.innerText || '').length) best = e;
                     }
-                    return 'not_found';
-                }"""
+                    return best;
+                };
+                let el = pick(e => {
+                    const x = (e.innerText || '').trim();
+                    return exact.indexOf(x) >= 0;
+                });
+                if (!el) {
+                    // 改版后入口可能带描述文字（如「识图模式 · 实验性」）：模糊匹配短文本
+                    el = pick(e => {
+                        const x = (e.innerText || '').trim();
+                        return fuzzy.some(k => x.indexOf(k) >= 0) && x.length <= 20;
+                    });
+                }
+                if (!el) return 'not_found';
+                try { el.scrollIntoView({block: 'center'}); } catch (err) {}
+                el.click();
+                return 'clicked';
+            }""" % (
+                json.dumps(list(VISION_ENTRY_LABELS)),
+                json.dumps(list(VISION_ENTRY_FUZZY)),
             )
-            if clicked == "not_found":
-                raise ConversationError(
-                    "未找到「识图模式」入口。可能当前账号未开放识图功能，或网页 UI 已更新。"
-                )
-            await asyncio.sleep(1)
-            ok = await self.page.evaluate(
-                "() => (document.body.innerText || '').indexOf(%s) >= 0" % json.dumps(VISION_WELCOME_TEXT)
+        )
+
+    async def _expand_vision_menu(self) -> bool:
+        """点击可能收纳模式入口的「+ / 更多」菜单按钮，返回是否点击了候选按钮"""
+        return await self.page.evaluate(
+            """() => {
+                const labels = %s;
+                const cands = [...document.querySelectorAll('div,span,button,[role=button]')].filter(e => {
+                    const x = (e.innerText || '').trim();
+                    if (labels.indexOf(x) >= 0) return true;
+                    const aria = e.getAttribute('aria-label') || '';
+                    const cls = '' + e.className;
+                    return /更多|more|add|plus/i.test(aria) ||
+                           /(^|\\s)(ds-)?(add|plus|more)[\\w-]*/i.test(cls);
+                });
+                if (!cands.length) return false;
+                let best = cands[0];
+                for (const e of cands) {
+                    const leaf = e.children.length === 0;
+                    const bestLeaf = best.children.length === 0;
+                    if (leaf && !bestLeaf) best = e;
+                    else if (leaf === bestLeaf &&
+                             (e.innerText || '').length < (best.innerText || '').length) best = e;
+                }
+                try { best.scrollIntoView({block: 'center'}); } catch (err) {}
+                best.click();
+                return true;
+            }""" % json.dumps(list(VISION_EXPAND_LABELS))
+        )
+
+    async def _dump_vision_failure(self):
+        """识图入口查找失败时留档：保存页面截图与文本片段，便于排查 UI 变化"""
+        try:
+            await self.page.screenshot(path=VISION_DEBUG_SHOT)
+            snippet = await self.page.evaluate(
+                "() => (document.body.innerText || '').slice(0, 600).replace(/\\s+/g, ' ')"
             )
-            if ok:
-                return
-        raise ConversationError("「识图模式」切换失败，请稍后重试。")
+            logger.warning(
+                f"⚠️ [Session] 未找到识图模式入口，截图已保存: {VISION_DEBUG_SHOT}\n"
+                f"    页面文本片段: {snippet}"
+            )
+        except Exception as e:
+            logger.warning(f"⚠️ [Session] 识图失败现场留档异常: {e}")
 
     async def _goto_session(self, conv: Conversation):
         """导航回已存在的会话页面"""

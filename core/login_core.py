@@ -1,7 +1,7 @@
 import asyncio
 import logging
 from cloakbrowser import launch_async
-from .config import STATE_FILE, QR_FILE
+from .config import BROWSER_LOCALE, BROWSER_TIMEZONE, STATE_FILE, QR_FILE
 
 logger = logging.getLogger("astrbot")
 
@@ -23,8 +23,17 @@ class CloakAuthenticator:
         browser = None
         try:
             logger.info("🚀 [LoginCore] 正在启动独立登录实例...")
-            browser = await launch_async(headless=True, humanize=True)
-            context = await browser.new_context()
+            # 与正式会话内核保持一致：强制中文 UI，避免英文系统下登录到英文界面
+            browser = await launch_async(
+                headless=True,
+                humanize=True,
+                locale=BROWSER_LOCALE,
+                timezone=BROWSER_TIMEZONE,
+            )
+            context = await browser.new_context(
+                locale=BROWSER_LOCALE,
+                timezone_id=BROWSER_TIMEZONE,
+            )
             page = await context.new_page()
 
             await page.goto("https://chat.deepseek.com/sign_in")

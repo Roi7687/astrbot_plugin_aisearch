@@ -1,7 +1,7 @@
 # astrbot_plugin_aisearch 开发文档
 
 > **插件名称**：AI搜索  
-> **版本**：v2.0.0  
+> **版本**：v2.1.1  
 > **作者**：Roi  
 > **许可证**：AGPL-3.0  
 > **仓库地址**：https://github.com/Roi7687/astrbot_plugin_aisearch  
@@ -16,6 +16,10 @@
 
 **v2.0.0 变更**：取消单轮 / 多轮区分，统一为 `/ais`；会话持久化 + 空闲自动销毁 + 主动通知；新增识图模式（@机器人 + 图片）、会话查看 / 重置 / 切换功能。
 
+**v2.1.0 变更**：会话模型由「双槽位」升级为「**多会话 + 本地 id**」——`/ais session` 与 `/ais list` 合并为 `/ais list`；每个会话由本地递增 id（1、2、3...）标识，`/ais list` 展示带 id 的会话列表，`/ais switch <id>` / `/ais list <id>` 按 id 切换；`/ais new` 不再销毁旧会话，旧会话保留在列表中可随时切回；已关闭的会话按 id 切换时自动重建；空闲计时器与主动通知改为按会话 id 索引。
+
+**v2.1.1 变更**：修复 Linux 服务器（英文系统）上识图模式报「未找到「识图模式」入口」的问题——浏览器启动/上下文强制 `locale=zh-CN`（`--lang` + Playwright context locale），保证 DeepSeek 恒为中文 UI；识图入口查找升级为多策略（中/英文精确标签 → 模糊文本 → 展开「+ / 更多」菜单），失败时保存 `vision_debug.png` 截图与页面文本留档。
+
 ---
 
 ## 二、项目结构
@@ -26,14 +30,15 @@ astrbot_plugin_aisearch/
 │   ├── __init__.py
 │   ├── config.py              # 全局配置：路径常量、会话/识图参数 & 自定义异常
 │   ├── command_parser.py      # /ais 指令参数解析器（纯函数，可单测）
-│   ├── session_core.py        # 统一持久化会话核心（普通/识图双槽位）
+│   ├── session_core.py        # 统一持久化会话核心（多会话 + 本地 id 计数）
 │   └── login_core.py          # 登录模块：微信扫码登录 DeepSeek
 ├── tests/                     # 单元测试（mock 掉浏览器依赖）
-│   └── test_session_core_mock.py
+│   ├── test_command_parser.py      # 指令解析 33 用例
+│   └── test_session_core_mock.py   # 会话核心 mock 测试（含旧数据迁移）
 ├── __init__.py                # 包初始化文件（空）
 ├── main.py                    # 插件主入口：命令注册、异步调度、主动通知
 ├── auth_state.json            # 持久化存储的登录凭证（cookies/localStorage）
-├── conversations.json         # 会话元数据持久化（会话 ID / URL / 消息数）
+├── conversations.json         # 会话元数据持久化（本地 id / 会话 ID / URL / 消息数）
 ├── metadata.yaml              # AstrBot 插件元数据
 ├── requirements.txt           # Python 依赖清单
 ├── README.md                  # 项目说明
@@ -64,38 +69,45 @@ astrbot_plugin_aisearch/
 |------|------|
 | `parse_ais_command(raw)` | 解析 `/ais` 后的参数，返回 (action, payload) |
 
-**返回的 action**：`usage` / `help` / `send` / `new` / `session` / `list` / `switch`
+**返回的 action**：`usage` / `help` / `send` / `new` / `list` / `switch`
 
 **解析规则**：
 - 开头的 `-t` / `-v` 旗标（可组合，如 `-v -t`）
 - 首个 token 命中子命令关键词表（含中文别名：重置/状态/列表/切换/帮助）→ 子命令
+  - `session` / `状态` / `会话` / `info` / `查看` 均为 `list` 的别名（已合并）
+  - `list` / `switch` 后跟数字 → `{"local_id": int}`（按本地 id 切换）
+  - `list` / `switch` 后跟模式别名（识图/普通/图片/文本...）→ `{"mode": "vision"|"normal"}`
+  - `switch` 无参或参数无效 → `{"local_id": None, "mode": None}`（调用方显示列表）
 - 其余情况 → send（`-v` 时 mode=vision，否则由调用方决定当前模式）
 - 其余 token 原样拼接为提问文本
 
-### 3.3 `core/session_core.py` — 统一会话核心（全异步）
+### 3.3 `core/session_core.py` — 统一会话核心（全异步，多会话 + 本地 id）
 
 | 类 / 方法 | 说明 |
 |-----------|------|
-| `Conversation` | 会话元数据 dataclass（mode / session_id / url / message_count / created_at / last_active / destroyed） |
-| `DeepSeekSessionCore` | 统一会话核心 |
-| `send_message(mode, text, thinking)` | 在指定模式会话中发送文本（无会话自动创建） |
-| `send_image_message(mode, text, paths, thinking)` | 上传图片 + 发送提问（识图会话） |
-| `ensure_conversation(mode)` | 确保会话存在并切换到它 |
-| `switch_conversation(mode)` | 切换会话（不存在则创建） |
-| `reset_conversation(mode)` | 重置：服务器端删除旧会话 + 开启同模式新会话 |
-| `destroy_conversation(mode)` | 销毁会话（空闲超时调用），返回是否真有会话被销毁 |
-| `conversation_summary / list_summary` | 会话信息展示数据 |
+| `Conversation` | 会话元数据 dataclass（local_id / mode / session_id / url / message_count / created_at / last_active / destroyed） |
+| `DeepSeekSessionCore` | 统一会话核心：`conversations: dict[local_id, Conversation]` + `next_id` 计数器 + `current_id` |
+| `current_conversation` / `current_mode` | 当前会话 / 当前会话模式（只读属性） |
+| `send_message(text, thinking, mode=None)` | 在当前会话（或指定模式会话）发送文本，返回 `(是否新建, 回答文本)` |
+| `send_image_message(text, paths, thinking)` | 识图会话上传图片 + 发送提问，返回 `(是否新建, 回答文本)` |
+| `ensure_mode(mode)` | 确保当前会话为指定模式：复用该模式最近活跃会话或新建，返回 `(conv, 是否新建)` |
+| `switch_conversation(local_id)` | 按本地 id 切换；id 不存在报错，已销毁则同模式重建（id 保留），返回 `(conv, 是否重建)` |
+| `new_conversation(mode=None)` | 创建新会话（分配新 id）并设为当前；**不销毁旧会话** |
+| `destroy_conversation(local_id)` | 销毁会话（空闲超时调用），返回是否真有会话被销毁 |
+| `conversation_summary(local_id)` / `list_summary()` | 单个 / 全部会话展示数据（按 id 升序） |
 | `close()` | 关闭浏览器（插件卸载 / 登录刷新） |
 
 **设计要点**：
-- **双槽位**：普通（normal）与识图（vision）各一个持久会话，互不干扰
+- **多会话 + 本地 id**：本地维护会话列表（普通/识图混合），`next_id` 本地递增计数（1、2、3...），持久化于 conversations.json；重启后 id 连续不重复
 - **串行化**：所有页面操作经 `asyncio.Lock` 互斥，避免并发命令竞态
 - **惰性创建**：首次使用时才启动浏览器 / 开启新对话
-- **识图模式切换**：新对话页点击「识图模式」入口（叶节点文本匹配），以欢迎语「使用识图模式开始对话」或激活态类名验证
+- **模式复用**：`ensure_mode('vision')` 优先复用该模式最近活跃的未销毁会话，无则新建
+- **已销毁会话重建**：按 id 切换到 `destroyed=True` 的会话时，同模式重建并保留原 id
+- **识图模式切换**：新对话页点击「识图模式」入口（精确标签 → 模糊文本 → 展开「+ / 更多」菜单多策略查找，中/英文标签均支持），以欢迎语「使用识图模式开始对话」或激活态类名验证；查找失败时保存 vision_debug.png 截图留档
 - **图片上传**：Playwright `set_input_files` 注入 `input[type=file]`，以 `img[src^="blob:"]` 缩略图出现作为上传成功标志
 - **答案等待**：文本稳定检测（连续 9 秒无变化），保留引用角标清理与 HTML→Markdown 转换
 - **会话删除**：`POST /api/v0/chat_session/delete`（Bearer 令牌嗅探），新旧 URL 格式（`/a/chat/s/<uuid>` 与 `/s/<id>`）均兼容
-- **元数据持久化**：每次变更写入 conversations.json，重启后可切回未销毁会话
+- **元数据持久化**：每次变更写入 conversations.json（`{"next_id", "current_id", "conversations"}` 新格式；旧版 `{mode: {...}}` 双槽位格式自动迁移为 id 1=normal、2=vision）
 
 ### 3.4 `main.py` — 插件主入口
 
@@ -111,23 +123,25 @@ astrbot_plugin_aisearch/
 | `_build_keyboard()` / `_try_send_with_keyboard()` | QQ 官方平台键盘按钮消息（其余平台自动回退纯文本） |
 | `login_command()` | `/cloak登录`：后台线程扫码登录，成功后重置浏览器内核 |
 
-**命令列表（v2.0.0）**：
+**命令列表（v2.1.0）**：
 
 | 命令 | 说明 |
 |------|------|
 | `/ais <问题>` | 当前会话提问（无会话自动创建） |
 | `/ais -t <问题>` | 深度思考 |
 | `/ais -v <问题>` | 切到识图会话提问 |
-| `/ais new`（reset/重置） | 重置会话 |
-| `/ais session`（状态） | 查看当前会话 |
-| `/ais list`（列表） | 查看全部会话 |
-| `/ais switch [识图/普通]` | 切换会话 |
+| `/ais new`（reset/重置） | 开启新会话（旧会话保留，可按 id 切回） |
+| `/ais list`（列表/状态/session） | 查看全部会话（带本地 id，👉 为当前） |
+| `/ais switch <id>`（切换） | 按本地 id 切换会话（已关闭的自动重建） |
+| `/ais switch 识图/普通` | 按模式切换（复用该模式最近会话，无则新建） |
+| `/ais list <id>` | 列表便捷切换（等同于 /ais switch <id>） |
 | `/ais help`（帮助） | 帮助 |
 | `/cloak登录` | 微信扫码登录 |
 
 **主动通知策略**：
-- 命令触发的状态变化（创建/重置/切换）：在命令回复中带前缀说明
+- 命令触发的状态变化（创建/切换）：在命令回复中带前缀说明（含会话 #id）
 - 空闲超时销毁：向该会话最后使用的聊天窗口**主动推送**（QQ 官方平台用 `post_group_message / post_c2c_message`，其余平台用 `context.send_message(unified_msg_origin, MessageChain)`）
+- 计时器与通知来源均按会话 **local_id** 索引（`_timer_tasks` / `_notice_sources` 的 key）
 
 ### 3.5 `core/login_core.py` — 登录模块
 
@@ -158,25 +172,26 @@ astrbot_plugin_aisearch/
        │
        ▼
   ai_search_command() → parse_ais_command()
-       │  send: mode = -v ? vision : current_mode
+       │  send: mode = -v ? "vision" : None（保持当前会话）
        ▼
-  DeepSeekSessionCore.send_message(mode, text, thinking)
+  DeepSeekSessionCore.send_message(text, thinking, mode) → (created, result)
        │
-       ├─ 无会话/已销毁？ ──→ _create_conversation(mode)
-       │                        ├─ _open_new_chat()（新对话页）
-       │                        └─ vision？ _switch_to_vision()（点击识图模式）
-       │
-       ├─ 已有会话？ ──→ _goto_session(conv.url)
+       ├─ ensure_current_locked(mode)：
+       │    ├─ 当前会话匹配？ ──→ _goto_session(conv.url)
+       │    ├─ mode 指定？ ──→ 复用该模式最近活跃会话 / 新建
+       │    └─ 无当前会话？ ──→ _create_conversation(normal) + _register(分配新 id)
+       │                          ├─ _open_new_chat()（新对话页）
+       │                          └─ vision？ _switch_to_vision()（点击识图模式）
        │
        ├─ _toggle_thinking() + 输入 + Enter/按钮发送
        ├─ 文本稳定检测（9s 无变化）→ HTML → Markdown
-       └─ _mark_active()（消息数+1，刷新空闲计时）
+       └─ _mark_active(conv)（消息数+1，刷新空闲计时，回写真实 URL/id）
        │
        ▼
-  返回结果（QQ 官方附带键盘按钮）
+  返回结果（created 时前缀「🟢 已开启新的…（会话 #id）」；QQ 官方附带键盘按钮）
        │
        ▼
-  _arm_idle_timer(mode) → 300s 无活动 → destroy + 主动通知
+  _arm_idle_timer(local_id) → 300s 无活动 → destroy + 主动通知
 ```
 
 ### 识图（@机器人 + 图片）
@@ -191,8 +206,8 @@ astrbot_plugin_aisearch/
        ▼
   _prepare_image_paths()（convert_to_file_path / 下载 / PIL 压缩）
        ▼
-  send_image_message(vision, text, paths)
-       ├─ 创建/切换到识图会话
+  send_image_message(text, paths) → (created, result)
+       ├─ ensure_current_locked(vision)：复用最近识图会话或新建（分配新 id）
        ├─ set_input_files 上传 → 等 blob 缩略图
        └─ 输入文字（无则默认提示词）→ 发送 → 等待答案
        ▼
@@ -220,6 +235,30 @@ astrbot_plugin_aisearch/
 | 会话 ID 兼容新旧 URL | ✅ | /a/chat/s/<uuid> 与 /s/<id> |
 | 单元测试 | ✅ | 指令解析 23 用例 + 会话核心 mock 测试（tests/） |
 
+### ✅ v2.1.0 已完成功能
+
+| 功能 | 状态 | 说明 |
+|------|------|------|
+| 多会话 + 本地 id | ✅ | 会话列表按本地递增 id（1、2、3...）索引，conversations.json 持久化 next_id，重启 id 连续 |
+| 合并 session/list | ✅ | /ais session（状态/会话/info）全部合并为 /ais list，统一展示带 id 的会话列表（👉 为当前） |
+| 按 id 切换 | ✅ | /ais switch <id> 或 /ais list <id>；id 不存在友好报错 |
+| 已关闭会话重建 | ✅ | 按 id 切换已销毁会话时同模式重建并保留原 id（/ais list 中标注「⏸ 已关闭」） |
+| /ais new 保留旧会话 | ✅ | 新建会话不再销毁旧会话，旧会话可随时按 id 切回 |
+| 按模式切换 | ✅ | /ais switch 识图/普通：复用该模式最近活跃会话，无则新建 |
+| 修复 list 报错 | ✅ | 补全缺失的 _format_session_list 展示逻辑（此前引用未定义方法导致报错） |
+| 旧数据迁移 | ✅ | 旧版 {mode: {...}} 双槽位 conversations.json 自动迁移为 id 1=normal、2=vision |
+| 单元测试 | ✅ | 指令解析 33 用例（含合并/切换语法）+ 会话核心 mock 测试（含迁移用例） |
+
+### ✅ v2.1.1 已完成功能
+
+| 功能 | 状态 | 说明 |
+|------|------|------|
+| 修复 Linux 识图入口找不到 | ✅ | 浏览器强制 `locale=zh-CN`（launch `--lang` + context locale），DeepSeek 恒为中文 UI，不再受服务器系统语言影响 |
+| 识图入口多策略查找 | ✅ | 中/英文精确标签 → 模糊文本（带描述的入口）→ 展开「+ / 更多」菜单；点击优先最深叶节点 |
+| 失败现场留档 | ✅ | 三次查找失败后保存 `vision_debug.png` 截图 + 页面文本片段到插件目录，日志含完整提示 |
+| 新对话页就绪等待 | ✅ | `_open_new_chat` 等待 textarea 可见，慢速服务器下不再因页面未渲染完而误报 |
+| 单元测试 | ✅ | 33 用例 + 会话核心 mock 测试全部通过（测试运行时会临时隔离真实 conversations.json） |
+
 ### ⚠️ 已知问题 / 待改进
 
 - **UI 依赖**：识图模式入口、上传输入框等选择器基于 2026-06 上线的 DeepSeek 网页版 UI，改版后需更新 `session_core.py`
@@ -240,14 +279,14 @@ astrbot_plugin_aisearch/
 
 1. 首次使用前，发送 `/cloak登录` 微信扫码登录
 2. **提问**：`/ais [-t] <问题>`；**识图**：`/ais -v <问题>` 或群聊 @机器人 + 图片
-3. **会话管理**：`/ais session` 查看状态；`/ais new` 重置；`/ais switch` 切换
+3. **会话管理**：`/ais list` 查看全部会话（带本地 id）；`/ais switch <id>` 按 id 切换；`/ais new` 开启新会话（旧会话保留）
 4. 示例：
    - `/ais 今天有什么大新闻`
    - `/ais -t 解释量子纠缠的原理`（深度思考）
    - 群里 @机器人 发一张截图 → 自动识图分析
-   - `/ais switch 识图` → `/ais 这张图里有什么公式`
-5. 空闲 300 秒无活动，会话自动关闭并收到通知
+   - `/ais list` → `/ais switch 2` → `/ais 这张图里有什么公式`
+5. 空闲 300 秒无活动，会话自动关闭并收到通知；已关闭的会话按 id 切换时自动重建
 
 ---
 
-*文档更新日期：2026-08-29（v2.0.0）*
+*文档更新日期：2026-08-29（v2.1.1）*

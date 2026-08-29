@@ -45,8 +45,8 @@ class CloakSearchPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
         self.session = DeepSeekSessionCore()
-        self._timer_tasks: dict[str, asyncio.Task] = {}   # mode -> 空闲计时任务
-        self._notice_sources: dict[str, dict] = {}        # mode -> 主动通知来源
+        self._timer_tasks: dict[int, asyncio.Task] = {}   # local_id -> 空闲计时任务
+        self._notice_sources: dict[int, dict] = {}        # local_id -> 主动通知来源
 
     # ═════════════════════ 统一指令：/ais ═════════════════════
 
@@ -60,57 +60,80 @@ class CloakSearchPlugin(Star):
         if action == "help":
             yield event.plain_result(self._help_text())
             return
-        if action == "session":
-            info = self.session.conversation_summary(self.session.current_mode)
-            yield event.plain_result(self._format_session_info(info))
-            return
         if action == "list":
+            # /ais list — 查看全部会话（带本地 id），列表页可 /ais list <id> 直接切换
             yield event.plain_result(self._format_session_list())
             return
-        if action == "new":
-            mode = self.session.current_mode
-            self._record_notice_source(mode, event)
-            try:
-                await self.session.reset_conversation(mode)
-                self._arm_idle_timer(mode)
-                yield event.plain_result(
-                    f"🔄 已关闭旧会话并开启新的{MODE_LABELS.get(mode, mode)}。\n可以直接发送 /ais 开始提问。"
-                )
-            except AuthError:
-                yield event.plain_result(self._auth_error_text())
-            except Exception as e:
-                yield event.plain_result(f"❌ 重置会话失败: {e}")
-            return
         if action == "switch":
-            mode_arg = payload.get("mode_arg")
-            if not mode_arg:
-                yield event.plain_result(self._format_switch_menu())
+            # /ais switch <id>（按本地 id 切换）｜ /ais switch 识图/普通（按模式切换）
+            local_id = payload.get("local_id")
+            mode = payload.get("mode")
+            if local_id is None and mode is None:
+                yield event.plain_result(self._format_session_list())
                 return
-            self._record_notice_source(mode_arg, event)
             try:
-                await self.session.switch_conversation(mode_arg)
-                self._arm_idle_timer(mode_arg)
-                yield event.plain_result(
-                    f"🔀 已切换到{MODE_LABELS.get(mode_arg, mode_arg)}。\n直接发送 /ais 即可在该会话中提问。"
-                )
+                if local_id is not None:
+                    conv, rebuilt = await self.session.switch_conversation(local_id)
+                    self._record_notice_source(conv.local_id, event)
+                    self._arm_idle_timer(conv.local_id)
+                    label = MODE_LABELS.get(conv.mode, conv.mode)
+                    extra = (
+                        "（原会话已关闭，已自动重建）"
+                        if rebuilt
+                        else f"（已发 {conv.message_count} 条）"
+                    )
+                    yield event.plain_result(
+                        f"🔀 已切换到会话 #{conv.local_id}（{label}{extra}）。\n直接发送 /ais 即可在该会话中提问。"
+                    )
+                else:
+                    conv, created = await self.session.ensure_mode(mode)
+                    self._record_notice_source(conv.local_id, event)
+                    self._arm_idle_timer(conv.local_id)
+                    label = MODE_LABELS.get(conv.mode, conv.mode)
+                    prefix = "🟢 已新建" if created else "🔀 已切换到"
+                    yield event.plain_result(
+                        f"{prefix}会话 #{conv.local_id}（{label}）。\n直接发送 /ais 即可在该会话中提问。"
+                    )
             except AuthError:
                 yield event.plain_result(self._auth_error_text())
+            except ConversationError as e:
+                yield event.plain_result(f"❌ 切换会话失败: {e}")
             except Exception as e:
                 yield event.plain_result(f"❌ 切换会话失败: {e}")
             return
+        if action == "new":
+            # /ais new — 开启新会话（旧会话保留在列表中，可按 id 切回）
+            try:
+                conv = await self.session.new_conversation()
+                self._record_notice_source(conv.local_id, event)
+                self._arm_idle_timer(conv.local_id)
+                yield event.plain_result(
+                    f"🔄 已开启新的{MODE_LABELS.get(conv.mode, conv.mode)}（会话 #{conv.local_id}）。\n"
+                    f"旧会话保留在列表中：/ais list 可查看，/ais switch <id> 可切回。"
+                )
+            except AuthError:
+                yield event.plain_result(self._auth_error_text())
+            except Exception as e:
+                yield event.plain_result(f"❌ 新建会话失败: {e}")
+            return
 
         # —— 提问（send）——
-        mode = payload.get("mode") or self.session.current_mode
+        mode = payload.get("mode") or None  # "vision" 或 None（保持当前会话）
         text = payload["text"]
         thinking = payload["thinking"]
-        self._record_notice_source(mode, event)
         try:
-            conv_before = self.session.get_conversation(mode)
-            created = not conv_before or conv_before.destroyed
-            result = await self.session.send_message(mode, text, thinking)
-            self._arm_idle_timer(mode)
+            created, result = await self.session.send_message(text, thinking, mode)
+            conv = self.session.current_conversation
+            conv_id = conv.local_id if conv else 0
+            self._record_notice_source(conv_id, event)
+            self._arm_idle_timer(conv_id)
 
-            prefix = f"🟢 已开启新的{MODE_LABELS.get(mode, mode)}。\n\n" if created else ""
+            prefix = ""
+            if created and conv:
+                prefix = (
+                    f"🟢 已开启新的{MODE_LABELS.get(conv.mode, conv.mode)}"
+                    f"（会话 #{conv.local_id}）。\n\n"
+                )
             result = prefix + result
             kb = self._build_keyboard(
                 ("💬 继续对话", "/ais "),
@@ -146,21 +169,22 @@ class CloakSearchPlugin(Star):
 
         text = self._clean_image_text(event.get_message_str() or "")
         event.stop_event()  # 阻止默认 LLM 重复响应
-        self._record_notice_source(MODE_VISION, event)
 
         try:
-            conv_before = self.session.get_conversation(MODE_VISION)
-            created = not conv_before or conv_before.destroyed
-
             paths = await self._prepare_image_paths(images)
             if not paths:
                 yield event.plain_result("⚠️ 图片下载/解析失败，无法识图。")
                 return
 
-            result = await self.session.send_image_message(MODE_VISION, text, paths)
-            self._arm_idle_timer(MODE_VISION)
+            created, result = await self.session.send_image_message(text, paths)
+            conv = self.session.current_conversation
+            conv_id = conv.local_id if conv else 0
+            self._record_notice_source(conv_id, event)
+            self._arm_idle_timer(conv_id)
 
-            prefix = "🟢 已开启新的识图对话。\n\n" if created else ""
+            prefix = ""
+            if created and conv:
+                prefix = f"🟢 已开启新的识图对话（会话 #{conv.local_id}）。\n\n"
             result = prefix + result
             kb = self._build_keyboard(
                 ("💬 继续对话", "/ais "),
@@ -179,34 +203,36 @@ class CloakSearchPlugin(Star):
 
     # ═════════════════════ 空闲超时与主动通知 ═════════════════════
 
-    def _arm_idle_timer(self, mode: str):
+    def _arm_idle_timer(self, local_id: int):
         """重置指定会话的空闲计时器"""
-        task = self._timer_tasks.get(mode)
+        task = self._timer_tasks.get(local_id)
         if task and not task.done():
             task.cancel()
-        self._timer_tasks[mode] = asyncio.ensure_future(self._idle_waiter(mode))
+        self._timer_tasks[local_id] = asyncio.ensure_future(self._idle_waiter(local_id))
 
-    async def _idle_waiter(self, mode: str):
+    async def _idle_waiter(self, local_id: int):
         """空闲超时后自动销毁会话并主动通知用户"""
         try:
             await asyncio.sleep(IDLE_TIMEOUT_SECONDS)
-            conv = self.session.get_conversation(mode)
+            conv = self.session.get_conversation(local_id)
             if conv and not conv.destroyed:
-                logger.info(f"⏳ [AIS] {MODE_LABELS.get(mode, mode)}空闲超时，自动销毁...")
-                destroyed = await self.session.destroy_conversation(mode)
+                label = MODE_LABELS.get(conv.mode, conv.mode)
+                logger.info(f"⏳ [AIS] 会话 #{local_id}（{label}）空闲超时，自动销毁...")
+                destroyed = await self.session.destroy_conversation(local_id)
                 if destroyed:
                     await self._notify(
-                        mode,
-                        f"⏳ {MODE_LABELS.get(mode, mode)}已因 {IDLE_TIMEOUT_SECONDS} 秒无活动自动关闭。\n发送 /ais 即可开启新会话。",
+                        local_id,
+                        f"⏳ 会话 #{local_id}（{label}）已因 {IDLE_TIMEOUT_SECONDS} 秒无活动自动关闭。\n"
+                        f"发送 /ais 可开启新会话，/ais list 可查看全部会话。",
                     )
         except asyncio.CancelledError:
             pass
 
-    def _record_notice_source(self, mode: str, event: AstrMessageEvent):
+    def _record_notice_source(self, local_id: int, event: AstrMessageEvent):
         """记录会话最后使用的消息来源，用于状态变化的主动通知"""
         try:
             raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
-            self._notice_sources[mode] = {
+            self._notice_sources[local_id] = {
                 "umo": getattr(event, "unified_msg_origin", None),
                 "bot": getattr(event, "bot", None),
                 "raw": raw,
@@ -214,9 +240,9 @@ class CloakSearchPlugin(Star):
         except Exception:
             pass
 
-    async def _notify(self, mode: str, text: str):
+    async def _notify(self, local_id: int, text: str):
         """主动推送消息（QQ 官方平台走 bot API，其余平台走 context.send_message）"""
-        src = self._notice_sources.get(mode)
+        src = self._notice_sources.get(local_id)
         if not src:
             return
         try:
@@ -457,6 +483,28 @@ class CloakSearchPlugin(Star):
 
     # ═════════════════════ 展示文案 ═════════════════════
 
+    def _format_session_list(self) -> str:
+        """格式化全部会话列表（带本地 id，供 /ais list / /ais switch 无参时使用）"""
+        items = self.session.list_summary()
+        if not items:
+            return (
+                "📭 还没有任何会话。\n"
+                "直接发送 /ais 开始提问吧！"
+            )
+        lines = [f"📋 会话列表（共 {len(items)} 个，👉 为当前）:", ""]
+        for it in items:
+            marker = "👉" if it["is_current"] else "  "
+            status = "⏸ 已关闭" if it["destroyed"] else f"{it['message_count']} 条"
+            lines.append(
+                f"{marker} #{it['local_id']}  {it['label']} ｜ {status} ｜ 最后活跃 {it['last_active']}"
+            )
+        lines += [
+            "",
+            "💡 切换：/ais switch <id>（如 /ais switch 2），或 /ais list <id>",
+            "💡 新建：/ais new（旧会话保留，可随时切回）",
+        ]
+        return "\n".join(lines)
+
     @staticmethod
     def _usage_text() -> str:
         return (
@@ -464,8 +512,8 @@ class CloakSearchPlugin(Star):
             "• /ais <问题> — 在当前会话提问\n"
             "• /ais -t <问题> — 开启深度思考\n"
             "• /ais -v <问题> — 切到识图会话提问\n\n"
-            "📌 管理：/ais new（重置） ｜ /ais session（状态） ｜ "
-            "/ais list（列表） ｜ /ais switch（切换） ｜ /ais help（帮助）"
+            "📌 管理：/ais list（列表） ｜ /ais switch <id>（切换） ｜ "
+            "/ais new（新建） ｜ /ais help（帮助）"
         )
 
     @staticmethod
@@ -476,20 +524,23 @@ class CloakSearchPlugin(Star):
             "• /ais <问题> — 在当前会话联网提问（无会话自动创建）\n"
             "• /ais -t <问题> — 开启深度思考模式\n"
             "• /ais -v <问题> — 切到「识图模式」会话提问（无则自动创建）\n"
-            "• /ais new（或 reset/重置）— 关闭当前会话并开启新会话\n"
-            "• /ais session（或 状态）— 查看当前会话信息\n"
-            "• /ais list（或 列表）— 查看全部会话\n"
-            "• /ais switch [识图/普通]（或 切换）— 切换当前会话\n"
+            "• /ais new（或 reset/重置）— 开启新会话，旧会话保留在列表中\n"
+            "• /ais list（或 列表/状态/session）— 查看全部会话（带本地 id，👉 为当前）\n"
+            "• /ais switch <id>（或 切换）— 按本地 id 切换会话，如 /ais switch 2\n"
+            "• /ais switch 识图/普通 — 切换到该模式最近使用的会话（无则新建）\n"
+            "• /ais list <id> — 列表便捷切换（等同于 /ais switch <id>）\n"
             "• /ais help（或 帮助）— 显示本帮助\n\n"
             "🖼 识图模式：在群聊中 @机器人 并发送图片（可附带文字），"
             "或在私聊中直接发送图片，即可自动进入识图会话。\n\n"
-            "⏳ 会话空闲超时（默认 300 秒）后自动关闭，并主动通知您。\n\n"
+            "⏳ 会话空闲超时（默认 300 秒）后自动关闭，并主动通知您；"
+            "已关闭的会话按 id 切换时会自动重建。\n\n"
             "📌 其他：\n"
             "• /cloak登录 — 微信扫码登录 DeepSeek\n"
             "• 示例：/ais 今天有什么大新闻\n"
             "  /ais -t 解释量子纠缠的原理\n"
             "  /ais -v 帮我看看这张图的配色\n"
-            "  /ais switch 识图"
+            "  /ais list\n"
+            "  /ais switch 2"
         )
 
     @staticmethod
