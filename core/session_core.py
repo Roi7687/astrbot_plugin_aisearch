@@ -84,6 +84,7 @@ class DeepSeekSessionCore:
         self.context = None
         self.page = None
         self.bearer_token = None
+        self._toggle_warned: set = set()    # 已警告过的模式开关名（避免日志刷屏）
         self.lock = asyncio.Lock()      # 串行化所有页面操作
         self.conversations: dict[int, Conversation] = {}  # local_id -> 会话
         self.next_id = 1                # 本地会话 id 计数器
@@ -628,15 +629,52 @@ class DeepSeekSessionCore:
 
     # ── 消息发送与等待 ──
 
+    async def _locate_by_text(
+        self, selectors: tuple, text: str, visible_timeout: float = 2.0
+    ):
+        """在候选 CSS 容器中查找「文本包含指定文字」的第一个可见元素。
+
+        兼容 cloakbrowser humanize：其 isolated-world resolver 不支持
+        .filter(has_text=...) 链式 locator，改用纯 CSS 定位 + all_inner_texts
+        过滤 + 尾部 .nth()。找不到返回 None。
+        """
+        for selector in selectors:
+            loc = self.page.locator(selector)
+            try:
+                texts = await loc.all_inner_texts()
+            except Exception:
+                continue
+            idx = next((i for i, t in enumerate(texts) if t and text in t), None)
+            if idx is None:
+                continue
+            btn = loc.nth(idx)
+            try:
+                await btn.wait_for(state="visible", timeout=visible_timeout)
+            except Exception:
+                continue
+            return btn
+        return None
+
     async def _ensure_toggle_on(self, label: str) -> bool:
         """确保指定名称的模式开关（「深度思考」/「联网搜索」）处于开启状态（幂等）。
 
         先检查开关的激活态（active/selected/aria-checked），未开启才点击，
         避免「已开启时再点一次反而关闭」的切换类 bug。
+        找不到开关时 2 秒内快速降级（仅首次警告一次），不阻塞提问——
+        DeepSeek 网页端默认/记忆开启状态，不影响使用。
         """
         try:
-            btn = self.page.locator(".ds-toggle-button").filter(has_text=label).first
-            await btn.wait_for(state="visible", timeout=15000)
+            btn = await self._locate_by_text(
+                (".ds-toggle-button", "button", "[role=button]"), label
+            )
+            if btn is None:
+                if label not in self._toggle_warned:
+                    self._toggle_warned.add(label)
+                    logger.warning(
+                        f"⚠️ [Session] 未找到「{label}」开关（DeepSeek 网页端默认开启，"
+                        f"不影响使用；如需禁用此检查请将 core/config.py 中 ALWAYS_* 改为 False）"
+                    )
+                return False
             active = await btn.evaluate(
                 """(el) => {
                     const c = '' + el.className;
@@ -653,7 +691,7 @@ class DeepSeekSessionCore:
                 logger.info(f"🔛 [Session] 已开启「{label}」")
             return True
         except Exception as e:
-            logger.warning(f"⚠️ [Session] 未能确认「{label}」开关状态: {e}")
+            logger.debug(f"[Session] 确认「{label}」开关状态失败: {e}")
             return False
 
     async def _type_and_send(self, text: str):
@@ -672,14 +710,11 @@ class DeepSeekSessionCore:
         cleared = await self._wait_textarea_cleared(6)
         if not cleared:
             try:
-                send_btn = self.page.locator(
-                    "div[role=button].ds-button--primary"
-                ).filter(has_text="发送").last
-                if await send_btn.count() == 0:
-                    send_btn = self.page.locator(
-                        "div[role=button].ds-button--primary"
-                    ).last
-                if await send_btn.count() > 0:
+                send_btn = await self._locate_by_text(
+                    ("div[role=button].ds-button--primary", "div[role=button]", "button"),
+                    "发送",
+                )
+                if send_btn is not None:
                     await send_btn.click()
             except Exception:
                 pass

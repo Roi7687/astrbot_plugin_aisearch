@@ -1,7 +1,7 @@
 # astrbot_plugin_aisearch 开发文档
 
 > **插件名称**：AI搜索  
-> **版本**：v2.2.3  
+> **版本**：v2.2.4  
 > **作者**：Roi  
 > **许可证**：AGPL-3.0  
 > **仓库地址**：https://github.com/Roi7687/astrbot_plugin_aisearch  
@@ -27,6 +27,8 @@
 **v2.2.2 变更**：**减少冗余通知/防刷屏**——① 取消会话空闲超时的主动推送通知（`_notify` / `_record_notice_source` / `_notice_sources` 全部移除，超时静默销毁，仅留日志）；② 自动触发/识图处理器新增**自我消息过滤**（`_is_self_message`：`get_sender_id() == get_self_id()` 时跳过），防止部分平台回传机器人自身消息导致自我回复循环刷屏。
 
 **v2.2.3 变更**：**修复自动触发拦截指令**——AstrBot 的 waking_check 阶段会把指令前缀（默认 `/`）从 `message_str` 剥离（`/cloak登录` 到达插件时已是 `cloak登录`），导致 `on_auto_message` 的 `startswith("/")` 检查失效：指令文本被当作提问发送给 DeepSeek（报「未检测到登录凭证」），且 `stop_event()` 会阻断后续指令 handler（`StarRequestSubStage` 遇 `is_stopped` 即 break），`/cloak登录`、`/ais` 等指令全部失效。新增 `_is_command_message`：检查 `event.get_extra("activated_handlers")` 中是否存在带 Command 类 filter（CommandFilter / CommandGroupFilter，含其他插件与内置指令）的 handler，命中即让路。
+
+**v2.2.4 变更**：**修复模式开关检查报错与卡顿**——cloakbrowser 的 humanize（isolated-world resolver）不支持 `.filter(has_text=...)` 链式 locator，且「联网搜索」按钮在当前 UI 中无法定位导致每次提问 `wait_for` 15 秒超时。重写 `_ensure_toggle_on`：改用**纯 CSS 定位 + `all_inner_texts` 过滤 + 尾部 `.nth()`**（`_locate_by_text`），兼容 humanize；找不到开关时 **2 秒内快速降级**（DeepSeek 网页端默认/记忆开启，不影响使用），警告日志仅首次输出一次（`_toggle_warned` 缓存）；同步修复 `_type_and_send` 发送按钮兜底中的同类 `.filter()` 用法。
 
 ---
 
@@ -115,7 +117,7 @@ astrbot_plugin_aisearch/
 - **已销毁会话重建**：按 id 切换到 `destroyed=True` 的会话时，同模式重建并保留原 id
 - **识图模式切换**：新对话页点击「识图模式」入口（精确标签 → 模糊文本 → 展开「+ / 更多」菜单多策略查找，中/英文标签均支持），以欢迎语「使用识图模式开始对话」或激活态类名验证；查找失败时保存 vision_debug.png 截图留档
 - **图片上传**：Playwright `set_input_files` 注入 `input[type=file]` → 等 blob 缩略图出现 → **双路上传完成确认**（`_wait_upload_finished`：① 监听上传网络请求 POST/PUT 含 upload/file 全部响应；② DOM 上传中标志消失兜底），确认完成才发送提问，避免慢速网络下「文本已发送但图片未传完」
-- **固定启用模式开关**：`_ensure_toggle_on(label)` 幂等开启「深度思考」/「联网搜索」（检测 active/selected/aria-checked 激活态，已开启不重复点击，避免切换类 bug）
+- **固定启用模式开关**：`_ensure_toggle_on(label)` 幂等开启「深度思考」/「联网搜索」（检测 active/selected/aria-checked 激活态，已开启不重复点击，避免切换类 bug）；v2.2.4 起通过 `_locate_by_text`（纯 CSS + all_inner_texts + 尾部 .nth()）定位，兼容 cloakbrowser humanize；找不到时 2 秒内降级跳过（仅首次警告，DeepSeek 默认开启）
 - **答案等待**：发送前记录助手回复块数量为基线 → 等待块数超过基线定位「新回复」→ 对新回复做文本稳定检测（连续 9 秒无变化）**且** `_is_generation_finished` 确认页面无生成中标志（停止按钮/流式光标/思考中指示，排除回答正文与隐藏元素）才算完成（总上限 300 秒）；避免旧回复/用户消息误判与长停顿提前返回；保留引用角标清理与 HTML→Markdown 转换
 - **会话删除**：`POST /api/v0/chat_session/delete`（Bearer 令牌嗅探），新旧 URL 格式（`/a/chat/s/<uuid>` 与 `/s/<id>`）均兼容
 - **元数据持久化**：每次变更写入 conversations.json（`{"next_id", "current_id", "conversations"}` 新格式；旧版 `{mode: {...}}` 双槽位格式自动迁移为 id 1=normal、2=vision）
@@ -325,6 +327,14 @@ astrbot_plugin_aisearch/
 |------|------|------|
 | 修复自动触发拦截指令 | ✅ | `_is_command_message`：检查 activated_handlers 中带 Command 类 filter 的 handler（含其他插件/内置指令），命中即让路；修复 /cloak登录、/ais 等指令因指令前缀被 waking_check 剥离而被误当提问 + stop_event 阻断的问题 |
 
+### ✅ v2.2.4 已完成功能
+
+| 功能 | 状态 | 说明 |
+|------|------|------|
+| 模式开关检查兼容 humanize | ✅ | `_locate_by_text`（纯 CSS + all_inner_texts + 尾部 .nth()）替代 `.filter(has_text=...)` 链式 locator，修复 isolated-world resolver 报错 |
+| 找不到开关快速降级 | ✅ | 2 秒内跳过（不再 15 秒超时拖慢提问），警告仅首次输出（`_toggle_warned` 缓存） |
+| 发送按钮兜底同步修复 | ✅ | `_type_and_send` 中同类 `.filter()` 用法改为 `_locate_by_text` |
+
 ### ⚠️ 已知问题 / 待改进
 
 - **UI 依赖**：识图模式入口、上传输入框等选择器基于 2026-06 上线的 DeepSeek 网页版 UI，改版后需更新 `session_core.py`
@@ -354,4 +364,4 @@ astrbot_plugin_aisearch/
 
 ---
 
-*文档更新日期：2026-08-29（v2.2.3）*
+*文档更新日期：2026-08-30（v2.2.4）*
