@@ -1,7 +1,7 @@
 # astrbot_plugin_aisearch 开发文档
 
 > **插件名称**：AI搜索  
-> **版本**：v2.2.1  
+> **版本**：v2.2.2  
 > **作者**：Roi  
 > **许可证**：AGPL-3.0  
 > **仓库地址**：https://github.com/Roi7687/astrbot_plugin_aisearch  
@@ -23,6 +23,8 @@
 **v2.2.0 变更**：① **自动触发**——@机器人（或私聊）直接发文字/图片即可自动进入 AI 搜索对话，无需 `/ais` 指令；仅切换/新建会话时使用指令（`AUTO_TRIGGER` 可关）；② **固定启用深度思考 + 联网搜索**——每次发送前自动确保两个模式开关开启（幂等检测激活态，`ALWAYS_DEEP_THINK` / `ALWAYS_WEB_SEARCH` 可配）；③ **修复连续对话返回旧结果**——回答定位从「最后一回复块」改为「发送前回复块计数基线 + 定位新回复块」，避免上一轮回复或用户消息被误判为最新回答。
 
 **v2.2.1 变更**：修复慢速网络下识图「文本已发送但图片未上传完」导致 AI 识别不到图片的问题——上传等待从「blob 缩略图出现」升级为**双路上传完成确认**（① 监听上传网络请求 POST/PUT 含 upload/file 全部响应；② DOM 上传中标志消失兜底），确认完成才发送提问；同时**生成完成确认**——文本稳定后还需页面无「生成中」标志（停止按钮/流式光标/思考中指示，排除回答正文与隐藏元素）才返回结果，避免深度思考/长回答中间停顿 >9s 时提前返回半截答案；总等待上限放宽至 300 秒。
+
+**v2.2.2 变更**：**减少冗余通知/防刷屏**——① 取消会话空闲超时的主动推送通知（`_notify` / `_record_notice_source` / `_notice_sources` 全部移除，超时静默销毁，仅留日志）；② 自动触发/识图处理器新增**自我消息过滤**（`_is_self_message`：`get_sender_id() == get_self_id()` 时跳过），防止部分平台回传机器人自身消息导致自我回复循环刷屏。
 
 ---
 
@@ -124,9 +126,9 @@ astrbot_plugin_aisearch/
 | `ai_search_command()` | `/ais` 统一指令（send/new/session/list/switch/help） |
 | `on_image_message()` | `@filter.event_message_type(ALL)` 图片消息处理：@机器人 + 图片（或私聊图片）→ 识图会话 |
 | `on_auto_message()` | `@filter.event_message_type(ALL)` 自动触发：@机器人/私聊文本（非指令、非图片）→ 直接 AI 搜索对话，无需 /ais |
-| `_respond()` | 统一回复：记录通知来源 + 刷新空闲计时 + 「已开启新会话」前缀 + 键盘按钮；返回空串表示已发送 |
-| `_arm_idle_timer()` / `_idle_waiter()` | 每会话独立空闲计时器，超时销毁 + 主动通知 |
-| `_record_notice_source()` / `_notify()` | 记录消息来源；主动推送（QQ 官方走 bot API，其余走 `context.send_message`） |
+| `_respond()` | 统一回复：刷新空闲计时 + 「已开启新会话」前缀 + 键盘按钮；返回空串表示已发送 |
+| `_arm_idle_timer()` / `_idle_waiter()` | 每会话独立空闲计时器，超时**静默销毁**（不推送通知，避免刷屏） |
+| `_is_self_message()` | 跳过机器人自己发出的消息（部分平台会回传自身消息，防止自我回复循环） |
 | `_collect_images()` | 兼容新旧 AstrBot API 提取图片组件 |
 | `_prepare_image_paths()` | 图片 → 本地路径（自动下载、PIL 压缩） |
 | `_build_keyboard()` / `_try_send_with_keyboard()` | QQ 官方平台键盘按钮消息（其余平台自动回退纯文本） |
@@ -147,10 +149,10 @@ astrbot_plugin_aisearch/
 | `/ais help`（帮助） | 帮助 |
 | `/cloak登录` | 微信扫码登录 |
 
-**主动通知策略**：
-- 命令触发的状态变化（创建/切换）：在命令回复中带前缀说明（含会话 #id）
-- 空闲超时销毁：向该会话最后使用的聊天窗口**主动推送**（QQ 官方平台用 `post_group_message / post_c2c_message`，其余平台用 `context.send_message(unified_msg_origin, MessageChain)`）
-- 计时器与通知来源均按会话 **local_id** 索引（`_timer_tasks` / `_notice_sources` 的 key）
+**防刷屏策略（v2.2.2）**：
+- 会话空闲超时**静默销毁**，不推送任何主动通知（此前每会话超时都会向聊天窗口推送一条）
+- 自动触发 / 识图处理器跳过机器人自己发出的消息（`sender_id == self_id`），防止自我回复循环
+- 回复只跟随用户提问产生（指令 / 自动触发 / 识图各一条），QQ 官方平台键盘按钮与回复合并为一条消息
 
 ### 3.5 `core/login_core.py` — 登录模块
 
@@ -181,7 +183,7 @@ astrbot_plugin_aisearch/
        │
        ▼
   on_auto_message()（EventMessageType.ALL）
-       ├─ AUTO_TRIGGER 关闭 / 事件已停止 → 返回
+       ├─ AUTO_TRIGGER 关闭 / 事件已停止 / 机器人自身消息 → 返回
        ├─ 空文本 / 以 / 开头（指令） → 返回
        ├─ 含图片 → 返回（交给 on_image_message 识图）
        ├─ 群聊未@未唤醒 → 返回（不拦截正常聊天）
@@ -189,7 +191,7 @@ astrbot_plugin_aisearch/
        ▼
   session.send_message(text) → (created, result)
        ▼
-  _respond()：记录通知来源 + 刷新空闲计时 + 前缀 + 键盘按钮 → 回复
+  _respond()：刷新空闲计时 + 前缀 + 键盘按钮 → 回复
 ```
 
 ### 文本提问（/ais 或自动触发）
@@ -219,7 +221,7 @@ astrbot_plugin_aisearch/
   _respond()（created 时前缀「🟢 已开启新的…（会话 #id）」；QQ 官方附带键盘按钮）
        │
        ▼
-  _arm_idle_timer(local_id) → 300s 无活动 → destroy + 主动通知
+  _arm_idle_timer(local_id) → 300s 无活动 → destroy（静默，不推送通知）
 ```
 
 ### 识图（@机器人 + 图片）
@@ -305,10 +307,16 @@ astrbot_plugin_aisearch/
 | 生成完成确认 | ✅ | 文本稳定后还需 `_is_generation_finished`（无停止按钮/流式光标/思考中指示，排除回答正文与隐藏元素），深度思考/长回答停顿不再提前返回半截答案 |
 | 慢速网络适配 | ✅ | 上传等待 90s + 回答等待总上限 300s |
 
+### ✅ v2.2.2 已完成功能
+
+| 功能 | 状态 | 说明 |
+|------|------|------|
+| 取消超时主动通知 | ✅ | 会话空闲超时静默销毁（仅日志），`_notify` / `_record_notice_source` / `_notice_sources` 全部移除 |
+| 自我消息过滤 | ✅ | `_is_self_message`（sender_id == self_id）应用于自动触发与识图处理器，防自我回复循环刷屏 |
+
 ### ⚠️ 已知问题 / 待改进
 
 - **UI 依赖**：识图模式入口、上传输入框等选择器基于 2026-06 上线的 DeepSeek 网页版 UI，改版后需更新 `session_core.py`
-- **QQ 官方平台主动消息**：官方 API 主动推送依赖 `msg_id=None`，个别平台策略可能限流
 - **未实机验证**：识图全流程（登录态下）需在真实环境验证，选择器如有出入按日志调整
 - 多图片消息的图片顺序与文字绑定关系待实测确认
 
@@ -331,8 +339,8 @@ astrbot_plugin_aisearch/
    - @机器人 今天有什么大新闻（自动触发，深度思考+联网搜索固定开启）
    - 群里 @机器人 发一张截图 → 自动识图分析
    - `/ais list` → `/ais switch 2` → @机器人 这张图里有什么公式
-6. 空闲 300 秒无活动，会话自动关闭并收到通知；已关闭的会话按 id 切换时自动重建
+6. 空闲 300 秒无活动，会话自动关闭（静默，不推送通知）；已关闭的会话按 id 切换时自动重建
 
 ---
 
-*文档更新日期：2026-08-29（v2.2.1）*
+*文档更新日期：2026-08-29（v2.2.2）*

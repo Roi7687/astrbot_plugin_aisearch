@@ -5,7 +5,7 @@ import os
 import re
 import threading
 
-from astrbot.api.event import filter, AstrMessageEvent, MessageChain
+from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.event.filter import EventMessageType
 from astrbot.api.message_components import Image
 from astrbot.api.star import Context, Star
@@ -47,7 +47,6 @@ class CloakSearchPlugin(Star):
         super().__init__(context)
         self.session = DeepSeekSessionCore()
         self._timer_tasks: dict[int, asyncio.Task] = {}   # local_id -> 空闲计时任务
-        self._notice_sources: dict[int, dict] = {}        # local_id -> 主动通知来源
 
     # ═════════════════════ 统一指令：/ais ═════════════════════
 
@@ -75,7 +74,6 @@ class CloakSearchPlugin(Star):
             try:
                 if local_id is not None:
                     conv, rebuilt = await self.session.switch_conversation(local_id)
-                    self._record_notice_source(conv.local_id, event)
                     self._arm_idle_timer(conv.local_id)
                     label = MODE_LABELS.get(conv.mode, conv.mode)
                     extra = (
@@ -88,7 +86,6 @@ class CloakSearchPlugin(Star):
                     )
                 else:
                     conv, created = await self.session.ensure_mode(mode)
-                    self._record_notice_source(conv.local_id, event)
                     self._arm_idle_timer(conv.local_id)
                     label = MODE_LABELS.get(conv.mode, conv.mode)
                     prefix = "🟢 已新建" if created else "🔀 已切换到"
@@ -106,7 +103,6 @@ class CloakSearchPlugin(Star):
             # /ais new — 开启新会话（旧会话保留在列表中，可按 id 切回）
             try:
                 conv = await self.session.new_conversation()
-                self._record_notice_source(conv.local_id, event)
                 self._arm_idle_timer(conv.local_id)
                 yield event.plain_result(
                     f"🔄 已开启新的{MODE_LABELS.get(conv.mode, conv.mode)}（会话 #{conv.local_id}）。\n"
@@ -139,7 +135,7 @@ class CloakSearchPlugin(Star):
     @filter.event_message_type(EventMessageType.ALL)
     async def on_image_message(self, event: AstrMessageEvent):
         """@机器人 + 图片（或私聊图片）→ 自动进入识图会话"""
-        if event.is_stopped():
+        if event.is_stopped() or self._is_self_message(event):
             return
 
         images = await self._collect_images(event)
@@ -178,9 +174,10 @@ class CloakSearchPlugin(Star):
         """@机器人（或私聊）发送文本 → 自动进入 AI 搜索对话，无需 /ais 指令。
 
         仅在需要切换/新建会话时才使用 /ais switch、/ais new 等指令。
-        跳过：指令消息（/ 开头或 AstrBot 识别为指令）、图片消息（交给识图）。
+        跳过：指令消息（/ 开头或 AstrBot 识别为指令）、图片消息（交给识图）、
+        机器人自己发出的消息（部分平台会回传，防止自我回复循环）。
         """
-        if not AUTO_TRIGGER or event.is_stopped():
+        if not AUTO_TRIGGER or event.is_stopped() or self._is_self_message(event):
             return
 
         text = self._clean_image_text(event.get_message_str() or "")
@@ -213,13 +210,11 @@ class CloakSearchPlugin(Star):
     # ═════════════════════ 统一回复 ═════════════════════
 
     async def _respond(self, event: AstrMessageEvent, created: bool, result: str) -> str:
-        """统一回复 AI 搜索结果：记录通知来源 / 刷新空闲计时，
-        附「已开启新会话」前缀与键盘按钮。
+        """统一回复 AI 搜索结果：刷新空闲计时，附「已开启新会话」前缀与键盘按钮。
         返回最终文本；已通过键盘消息发送时返回空串（调用方无需再 yield）。"""
         conv = self.session.current_conversation
-        conv_id = conv.local_id if conv else 0
-        self._record_notice_source(conv_id, event)
-        self._arm_idle_timer(conv_id)
+        if conv:
+            self._arm_idle_timer(conv.local_id)
         if created and conv:
             result = (
                 f"🟢 已开启新的{MODE_LABELS.get(conv.mode, conv.mode)}"
@@ -235,7 +230,7 @@ class CloakSearchPlugin(Star):
             return ""
         return result
 
-    # ═════════════════════ 空闲超时与主动通知 ═════════════════════
+    # ═════════════════════ 空闲超时（静默销毁） ═════════════════════
 
     def _arm_idle_timer(self, local_id: int):
         """重置指定会话的空闲计时器"""
@@ -245,68 +240,27 @@ class CloakSearchPlugin(Star):
         self._timer_tasks[local_id] = asyncio.ensure_future(self._idle_waiter(local_id))
 
     async def _idle_waiter(self, local_id: int):
-        """空闲超时后自动销毁会话并主动通知用户"""
+        """空闲超时后静默销毁会话（不再主动推送通知，避免刷屏）"""
         try:
             await asyncio.sleep(IDLE_TIMEOUT_SECONDS)
             conv = self.session.get_conversation(local_id)
             if conv and not conv.destroyed:
                 label = MODE_LABELS.get(conv.mode, conv.mode)
-                logger.info(f"⏳ [AIS] 会话 #{local_id}（{label}）空闲超时，自动销毁...")
-                destroyed = await self.session.destroy_conversation(local_id)
-                if destroyed:
-                    await self._notify(
-                        local_id,
-                        f"⏳ 会话 #{local_id}（{label}）已因 {IDLE_TIMEOUT_SECONDS} 秒无活动自动关闭。\n"
-                        f"发送 /ais 可开启新会话，/ais list 可查看全部会话。",
-                    )
+                logger.info(f"⏳ [AIS] 会话 #{local_id}（{label}）空闲超时，静默销毁。")
+                await self.session.destroy_conversation(local_id)
         except asyncio.CancelledError:
             pass
 
-    def _record_notice_source(self, local_id: int, event: AstrMessageEvent):
-        """记录会话最后使用的消息来源，用于状态变化的主动通知"""
+    @staticmethod
+    def _is_self_message(event: AstrMessageEvent) -> bool:
+        """判断消息是否由机器人自己发出（部分平台会把机器人自己的消息回传，
+        不过滤会导致自我回复循环刷屏）"""
         try:
-            raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
-            self._notice_sources[local_id] = {
-                "umo": getattr(event, "unified_msg_origin", None),
-                "bot": getattr(event, "bot", None),
-                "raw": raw,
-            }
+            sender = str(event.get_sender_id() or "")
+            self_id = str(event.get_self_id() or "")
+            return bool(sender) and sender == self_id
         except Exception:
-            pass
-
-    async def _notify(self, local_id: int, text: str):
-        """主动推送消息（QQ 官方平台走 bot API，其余平台走 context.send_message）"""
-        src = self._notice_sources.get(local_id)
-        if not src:
-            return
-        try:
-            bot = src.get("bot")
-            raw = src.get("raw")
-            if bot is not None and raw is not None:
-                type_name = type(raw).__name__
-                if type_name == "GroupMessage":
-                    await bot.api.post_group_message(
-                        group_openid=raw.group_openid,
-                        msg_type=2,
-                        markdown={"content": text},
-                        msg_id=None,
-                        msg_seq=1,
-                    )
-                    return
-                if type_name == "C2CMessage":
-                    await bot.api.post_c2c_message(
-                        openid=raw.author.user_openid,
-                        msg_type=2,
-                        markdown={"content": text},
-                        msg_id=None,
-                        msg_seq=1,
-                    )
-                    return
-            umo = src.get("umo")
-            if umo:
-                await self.context.send_message(umo, MessageChain().message(text))
-        except Exception as e:
-            logger.warning(f"⚠️ [AIS] 主动通知发送失败: {e}")
+            return False
 
     # ═════════════════════ 图片工具 ═════════════════════
 
