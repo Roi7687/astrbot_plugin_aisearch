@@ -1,7 +1,7 @@
 # astrbot_plugin_aisearch 开发文档
 
 > **插件名称**：AI搜索  
-> **版本**：v2.2.4  
+> **版本**：v2.2.5  
 > **作者**：Roi  
 > **许可证**：AGPL-3.0  
 > **仓库地址**：https://github.com/Roi7687/astrbot_plugin_aisearch  
@@ -29,6 +29,8 @@
 **v2.2.3 变更**：**修复自动触发拦截指令**——AstrBot 的 waking_check 阶段会把指令前缀（默认 `/`）从 `message_str` 剥离（`/cloak登录` 到达插件时已是 `cloak登录`），导致 `on_auto_message` 的 `startswith("/")` 检查失效：指令文本被当作提问发送给 DeepSeek（报「未检测到登录凭证」），且 `stop_event()` 会阻断后续指令 handler（`StarRequestSubStage` 遇 `is_stopped` 即 break），`/cloak登录`、`/ais` 等指令全部失效。新增 `_is_command_message`：检查 `event.get_extra("activated_handlers")` 中是否存在带 Command 类 filter（CommandFilter / CommandGroupFilter，含其他插件与内置指令）的 handler，命中即让路。
 
 **v2.2.4 变更**：**修复模式开关检查报错与卡顿**——cloakbrowser 的 humanize（isolated-world resolver）不支持 `.filter(has_text=...)` 链式 locator，且「联网搜索」按钮在当前 UI 中无法定位导致每次提问 `wait_for` 15 秒超时。重写 `_ensure_toggle_on`：改用**纯 CSS 定位 + `all_inner_texts` 过滤 + 尾部 `.nth()`**（`_locate_by_text`），兼容 humanize；找不到开关时 **2 秒内快速降级**（DeepSeek 网页端默认/记忆开启，不影响使用），警告日志仅首次输出一次（`_toggle_warned` 缓存）；同步修复 `_type_and_send` 发送按钮兜底中的同类 `.filter()` 用法。
+
+**v2.2.5 变更**：**移除「固定启用深度思考/联网搜索」开关检查**——开关在 DeepSeek 当前网页 UI 中无法稳定定位（`.ds-toggle-button` 结构不匹配），检查始终落空且徒增日志噪音。删除 `_ensure_toggle_on` / `ALWAYS_DEEP_THINK` / `ALWAYS_WEB_SEARCH`，不再自动操作开关，深度思考与联网搜索跟随 DeepSeek 网页端设置（默认开启）；`-t` 旗标保留解析（兼容）但无实际效果，键盘按钮与帮助文案同步清理。
 
 ---
 
@@ -68,7 +70,6 @@ astrbot_plugin_aisearch/
 | `CONVERSATIONS_FILE` | 会话元数据持久化路径（conversations.json） |
 | `IDLE_TIMEOUT_SECONDS` | 会话空闲自动销毁时间（默认 300 秒） |
 | `MAX_IMAGE_BYTES` | 单张图片大小上限（超过自动压缩） |
-| `ALWAYS_DEEP_THINK` / `ALWAYS_WEB_SEARCH` | 固定开启「深度思考」/「联网搜索」（默认 True） |
 | `AUTO_TRIGGER` | 自动触发：@机器人/私聊直接提问无需 /ais（默认 True） |
 | `DEFAULT_VISION_PROMPT` | 仅发图不带文字时的默认提问 |
 | `VISION_WELCOME_TEXT` | 识图模式新会话欢迎语（用于验证切换成功） |
@@ -117,7 +118,7 @@ astrbot_plugin_aisearch/
 - **已销毁会话重建**：按 id 切换到 `destroyed=True` 的会话时，同模式重建并保留原 id
 - **识图模式切换**：新对话页点击「识图模式」入口（精确标签 → 模糊文本 → 展开「+ / 更多」菜单多策略查找，中/英文标签均支持），以欢迎语「使用识图模式开始对话」或激活态类名验证；查找失败时保存 vision_debug.png 截图留档
 - **图片上传**：Playwright `set_input_files` 注入 `input[type=file]` → 等 blob 缩略图出现 → **双路上传完成确认**（`_wait_upload_finished`：① 监听上传网络请求 POST/PUT 含 upload/file 全部响应；② DOM 上传中标志消失兜底），确认完成才发送提问，避免慢速网络下「文本已发送但图片未传完」
-- **固定启用模式开关**：`_ensure_toggle_on(label)` 幂等开启「深度思考」/「联网搜索」（检测 active/selected/aria-checked 激活态，已开启不重复点击，避免切换类 bug）；v2.2.4 起通过 `_locate_by_text`（纯 CSS + all_inner_texts + 尾部 .nth()）定位，兼容 cloakbrowser humanize；找不到时 2 秒内降级跳过（仅首次警告，DeepSeek 默认开启）
+- **深度思考/联网搜索**：v2.2.5 起**不自动操作开关**（UI 无法稳定定位，检查徒增噪音），跟随 DeepSeek 网页端设置（默认开启）；`-t` 旗标保留解析但无实际效果
 - **答案等待**：发送前记录助手回复块数量为基线 → 等待块数超过基线定位「新回复」→ 对新回复做文本稳定检测（连续 9 秒无变化）**且** `_is_generation_finished` 确认页面无生成中标志（停止按钮/流式光标/思考中指示，排除回答正文与隐藏元素）才算完成（总上限 300 秒）；避免旧回复/用户消息误判与长停顿提前返回；保留引用角标清理与 HTML→Markdown 转换
 - **会话删除**：`POST /api/v0/chat_session/delete`（Bearer 令牌嗅探），新旧 URL 格式（`/a/chat/s/<uuid>` 与 `/s/<id>`）均兼容
 - **元数据持久化**：每次变更写入 conversations.json（`{"next_id", "current_id", "conversations"}` 新格式；旧版 `{mode: {...}}` 双槽位格式自动迁移为 id 1=normal、2=vision）
@@ -144,7 +145,6 @@ astrbot_plugin_aisearch/
 | 命令 | 说明 |
 |------|------|
 | `/ais <问题>` | 当前会话提问（无会话自动创建） |
-| `/ais -t <问题>` | 深度思考 |
 | `/ais -v <问题>` | 切到识图会话提问 |
 | `/ais new`（reset/重置） | 开启新会话（旧会话保留，可按 id 切回） |
 | `/ais list`（列表/状态/session） | 查看全部会话（带本地 id，👉 为当前） |
@@ -153,6 +153,8 @@ astrbot_plugin_aisearch/
 | `/ais list <id>` | 列表便捷切换（等同于 /ais switch <id>） |
 | `/ais help`（帮助） | 帮助 |
 | `/cloak登录` | 微信扫码登录 |
+
+> `-t` 旗标自 v2.2.5 起保留解析但无实际效果（深度思考跟随 DeepSeek 网页端设置）。
 
 **防刷屏与指令保护策略**：
 - 会话空闲超时**静默销毁**，不推送任何主动通知（此前每会话超时都会向聊天窗口推送一条）
@@ -219,7 +221,6 @@ astrbot_plugin_aisearch/
        │                          ├─ _open_new_chat()（新对话页）
        │                          └─ vision？ _switch_to_vision()（点击识图模式）
        │
-       ├─ _ensure_toggle_on(深度思考/联网搜索)（固定开启，幂等）
        ├─ 输入 + Enter/按钮发送
        ├─ 等待新回复块（基线计数）→ 文本稳定检测（9s 无变化）→ HTML → Markdown
        └─ _mark_active(conv)（消息数+1，刷新空闲计时，回写真实 URL/id）
@@ -335,6 +336,13 @@ astrbot_plugin_aisearch/
 | 找不到开关快速降级 | ✅ | 2 秒内跳过（不再 15 秒超时拖慢提问），警告仅首次输出（`_toggle_warned` 缓存） |
 | 发送按钮兜底同步修复 | ✅ | `_type_and_send` 中同类 `.filter()` 用法改为 `_locate_by_text` |
 
+### ✅ v2.2.5 已完成功能
+
+| 功能 | 状态 | 说明 |
+|------|------|------|
+| 移除开关检查 | ✅ | 删除 `_ensure_toggle_on` / `ALWAYS_DEEP_THINK` / `ALWAYS_WEB_SEARCH` / `_toggle_warned`，不再自动操作深度思考/联网搜索开关，消除日志噪音 |
+| 文案清理 | ✅ | 键盘按钮移除「深度对话」，/ais help 与 usage、README 同步更新 |
+
 ### ⚠️ 已知问题 / 待改进
 
 - **UI 依赖**：识图模式入口、上传输入框等选择器基于 2026-06 上线的 DeepSeek 网页版 UI，改版后需更新 `session_core.py`
@@ -357,11 +365,11 @@ astrbot_plugin_aisearch/
 3. **识图**：@机器人 + 图片（或私聊发图）自动进入识图会话
 4. **会话管理**（仅切换时需要指令）：`/ais list` 查看全部会话（带本地 id）；`/ais switch <id>` 按 id 切换；`/ais new` 开启新会话（旧会话保留）
 5. 示例：
-   - @机器人 今天有什么大新闻（自动触发，深度思考+联网搜索固定开启）
+   - @机器人 今天有什么大新闻（自动触发，深度思考/联网搜索跟随 DeepSeek 网页端设置）
    - 群里 @机器人 发一张截图 → 自动识图分析
    - `/ais list` → `/ais switch 2` → @机器人 这张图里有什么公式
 6. 空闲 300 秒无活动，会话自动关闭（静默，不推送通知）；已关闭的会话按 id 切换时自动重建
 
 ---
 
-*文档更新日期：2026-08-30（v2.2.4）*
+*文档更新日期：2026-08-30（v2.2.5）*

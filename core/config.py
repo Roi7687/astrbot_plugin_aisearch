@@ -15,10 +15,6 @@ BROWSER_TIMEZONE = "Asia/Shanghai"
 IDLE_TIMEOUT_SECONDS = 300  # 会话无活动自动销毁（秒），修改后需重启插件生效
 MAX_IMAGE_BYTES = 8 * 1024 * 1024  # 单张图片上限（上传前压缩，超过则警告跳过）
 
-# ── 固定启用模式（每次发送前自动确保开启，无需 -t 旗标）──
-ALWAYS_DEEP_THINK = True  # 固定开启「深度思考」
-ALWAYS_WEB_SEARCH = True  # 固定开启「联网搜索」
-
 # ── 自动触发（无需 /ais 指令）──
 AUTO_TRIGGER = True  # @机器人（或私聊）发送文本 → 自动进入 AI 搜索对话；仅切换会话时需用指令
 

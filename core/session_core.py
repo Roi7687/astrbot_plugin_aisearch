@@ -21,8 +21,6 @@ from markdownify import markdownify as md
 from cloakbrowser import launch_async
 
 from .config import (
-    ALWAYS_DEEP_THINK,
-    ALWAYS_WEB_SEARCH,
     BROWSER_LOCALE,
     BROWSER_TIMEZONE,
     CONVERSATIONS_FILE,
@@ -84,7 +82,6 @@ class DeepSeekSessionCore:
         self.context = None
         self.page = None
         self.bearer_token = None
-        self._toggle_warned: set = set()    # 已警告过的模式开关名（避免日志刷屏）
         self.lock = asyncio.Lock()      # 串行化所有页面操作
         self.conversations: dict[int, Conversation] = {}  # local_id -> 会话
         self.next_id = 1                # 本地会话 id 计数器
@@ -655,45 +652,6 @@ class DeepSeekSessionCore:
             return btn
         return None
 
-    async def _ensure_toggle_on(self, label: str) -> bool:
-        """确保指定名称的模式开关（「深度思考」/「联网搜索」）处于开启状态（幂等）。
-
-        先检查开关的激活态（active/selected/aria-checked），未开启才点击，
-        避免「已开启时再点一次反而关闭」的切换类 bug。
-        找不到开关时 2 秒内快速降级（仅首次警告一次），不阻塞提问——
-        DeepSeek 网页端默认/记忆开启状态，不影响使用。
-        """
-        try:
-            btn = await self._locate_by_text(
-                (".ds-toggle-button", "button", "[role=button]"), label
-            )
-            if btn is None:
-                if label not in self._toggle_warned:
-                    self._toggle_warned.add(label)
-                    logger.warning(
-                        f"⚠️ [Session] 未找到「{label}」开关（DeepSeek 网页端默认开启，"
-                        f"不影响使用；如需禁用此检查请将 core/config.py 中 ALWAYS_* 改为 False）"
-                    )
-                return False
-            active = await btn.evaluate(
-                """(el) => {
-                    const c = '' + el.className;
-                    if (c.indexOf('active') >= 0 || c.indexOf('selected') >= 0 ||
-                        c.indexOf('checked') >= 0) return true;
-                    const aria = el.getAttribute('aria-checked') || el.getAttribute('aria-pressed');
-                    if (aria === 'true') return true;
-                    return false;
-                }"""
-            )
-            if not active:
-                await btn.click()
-                await asyncio.sleep(0.8)
-                logger.info(f"🔛 [Session] 已开启「{label}」")
-            return True
-        except Exception as e:
-            logger.debug(f"[Session] 确认「{label}」开关状态失败: {e}")
-            return False
-
     async def _type_and_send(self, text: str):
         """在输入框中输入文本并发送（Enter 优先，按钮兜底）"""
         input_box = self.page.locator(
@@ -739,11 +697,8 @@ class DeepSeekSessionCore:
         再对「第 baseline 条」新回复做文本稳定检测——避免上一轮回复
         （或兜底选择器误匹配到的用户消息）被当成最新结果返回。
         """
-        # 固定开启深度思考 / 联网搜索（幂等：已开启不会重复点击）
-        if ALWAYS_DEEP_THINK or thinking:
-            await self._ensure_toggle_on("深度思考")
-        if ALWAYS_WEB_SEARCH:
-            await self._ensure_toggle_on("联网搜索")
+        # v2.2.5 起不再自动操作「深度思考/联网搜索」开关（UI 选择器无法稳定定位，
+        # DeepSeek 网页端默认/记忆开启状态，不影响使用）。thinking 参数保留兼容但无实际作用。
 
         await self._type_and_send(text)
 
