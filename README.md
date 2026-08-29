@@ -2,7 +2,7 @@
 
 > **AI搜索** — 基于 [AstrBot](https://github.com/AstrBotDevs/AstrBot) 的 DeepSeek 联网 AI 搜索 / 识图插件
 >
-> 版本：v2.2.6 ｜ 作者：Roi ｜ 许可证：AGPL-3.0
+> 版本：v2.2.7 ｜ 作者：Roi ｜ 许可证：AGPL-3.0
 
 通过**自动化操控 DeepSeek Chat 网页端**（cloakbrowser 反检测无头浏览器），无需调用任何 API，即可在 QQ 等聊天平台直接使用 DeepSeek 的**联网搜索**与**识图模式**能力。
 

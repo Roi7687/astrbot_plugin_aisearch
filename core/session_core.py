@@ -692,14 +692,12 @@ class DeepSeekSessionCore:
     async def _send_query(self, text: str, thinking: bool) -> str:
         """在当前页面发送提问并等待回答（不含会话状态维护）。
 
-        回答定位策略：发送前记录页面中已有助手回复块数量作为基线，
-        发送后等待回复块数**超过基线**（真正出现了新回复），
-        再对「第 baseline 条」新回复做文本稳定检测——避免上一轮回复
-        （或兜底选择器误匹配到的用户消息）被当成最新结果返回。
+        等待策略（v2.2.7 回归简单版）：发送后等待对话框最后一条回复出现，
+        随后对其做**文本稳定检测**（连续 9 秒无变化视为输出完成）。
+        不做回复块计数 / 生成标志 / 补发重试等复杂判断，避免在部分环境下
+        卡死或误判；保留 300 秒总上限防止异常情况下无限等待。
+        thinking 参数保留兼容但无实际作用（深度思考跟随 DeepSeek 网页端设置）。
         """
-        # v2.2.5 起不再自动操作「深度思考/联网搜索」开关（UI 选择器无法稳定定位，
-        # DeepSeek 网页端默认/记忆开启状态，不影响使用）。thinking 参数保留兼容但无实际作用。
-
         await self._type_and_send(text)
 
         # 发送后的快速错误检测
@@ -713,76 +711,26 @@ class DeepSeekSessionCore:
         if rejected:
             return "⚠️ DeepSeek 拒绝了这条消息（内容违反使用规范或发送失败），请调整后重试。"
 
-        # 以发送前的回复块数量为基线，定位「新回复」
         answer_locator = self.page.locator(
             "div.ds-markdown.ds-assistant-message-main-content"
         )
-        baseline = await answer_locator.count()
-        if baseline == 0:
+        try:
+            await answer_locator.last.wait_for(state="visible", timeout=30000)
+        except Exception:
             # UI 变动兜底：退回通用 .ds-markdown 选择器
             answer_locator = self.page.locator(".ds-markdown")
-            baseline = await answer_locator.count()
-
-        new_answer = None
-        deadline = time.time() + 180  # 慢速网络 + 深度思考 + 联网搜索：回答可能超过 60 秒才开始输出
-        last_send_check = 0.0
-        send_fail_count = 0
-        while time.time() < deadline:
-            current = await answer_locator.count()
-            if current > baseline:
-                new_answer = answer_locator.nth(baseline)
-                break
-            # 每 5 秒确认消息是否真的已发出（输入框已清空）：
-            # 若未清空说明 Enter 发送失败，补点发送按钮；连续 3 次仍失败则提前报错，
-            # 避免消息根本没发出去却干等超时
-            if time.time() - last_send_check >= 5:
-                last_send_check = time.time()
-                try:
-                    ta_value = await self.page.evaluate(
-                        "() => { const ta = document.querySelector('textarea'); return ta ? ta.value : ''; }"
-                    )
-                except Exception:
-                    ta_value = ""
-                if ta_value:
-                    send_fail_count += 1
-                    logger.info(
-                        f"⚠️ [Session] 输入框未清空，消息可能未发出（第 {send_fail_count} 次），补点发送按钮..."
-                    )
-                    try:
-                        send_btn = await self._locate_by_text(
-                            (
-                                "div[role=button].ds-button--primary",
-                                "div[role=button]",
-                                "button",
-                            ),
-                            "发送",
-                            visible_timeout=3.0,
-                        )
-                        if send_btn is not None:
-                            await send_btn.click()
-                    except Exception:
-                        pass
-                    if send_fail_count >= 3:
-                        raise ConversationError("消息发送失败，请检查登录状态后重试。")
-            await asyncio.sleep(0.5)
-        if new_answer is None:
-            # 超时留档：输出页面文本片段与输入框状态，便于排查
             try:
-                snippet = await self.page.evaluate(
-                    "() => (document.body.innerText || '').slice(0, 300).replace(/\\s+/g, ' ')"
-                )
-                logger.warning(f"⚠️ [Session] 等待 AI 回答超时。页面文本: {snippet}")
+                await answer_locator.last.wait_for(state="visible", timeout=30000)
             except Exception:
-                pass
-            raise ConversationError("等待 AI 回答超时，请稍后重试。")
+                raise ConversationError("等待 AI 回答超时，请稍后重试。")
 
-        # 对新回复做文本稳定检测（连续 9 秒无变化视为输出完成）
+        # 文本稳定检测：连续 9 秒无变化视为输出完成
         previous_text = ""
         stable_count = 0
-        total_deadline = time.time() + 300  # 慢速网络/深度思考/长回答留足时间
+        total_deadline = time.time() + 300  # 总上限，防止异常情况下无限等待
         while True:
             try:
-                current_text = await new_answer.inner_text()
+                current_text = await answer_locator.last.inner_text()
             except Exception:
                 current_text = ""
             if current_text == previous_text and len(current_text) > 0:
@@ -792,12 +740,7 @@ class DeepSeekSessionCore:
                 previous_text = current_text
 
             if stable_count >= STABLE_CHECKS:
-                # 文本已稳定：再确认页面无「生成中」标志（停止按钮/流式光标），
-                # 确保流式输出真正结束——深度思考或长回答中间停顿可能超过 9 秒，
-                # 仅靠文本稳定会提前返回半截答案。
-                if await self._is_generation_finished():
-                    break
-                stable_count = 0  # 仍在生成：重置稳定计数继续等待
+                break
             if time.time() > total_deadline:
                 break
             await asyncio.sleep(STABLE_INTERVAL)
@@ -810,45 +753,8 @@ class DeepSeekSessionCore:
         except Exception as e:
             logger.warning(f"⚠️ [Session] 清理 DOM 引用角标异常: {e}")
 
-        raw_html = await new_answer.inner_html()
+        raw_html = await answer_locator.last.inner_html()
         return md(raw_html, heading_style="ATX")
-
-    async def _is_generation_finished(self) -> bool:
-        """判断 DeepSeek 是否已停止生成（流式输出真正结束）。
-
-        负向信号（任一存在即视为仍在生成）：
-        ① 停止生成按钮（生成期间出现）；② 流式光标 / 生成中 / 思考中标记（可见）；
-        ③ 输入区发送中状态。
-        排除回答正文（.ds-markdown）与隐藏元素，避免回答内容或静态布局误触发。
-        """
-        return await self.page.evaluate(
-            """() => {
-                const inMd = e => !!(e.closest && e.closest('.ds-markdown'));
-                const visible = e => e.offsetParent !== null ||
-                                     (e.getClientRects && e.getClientRects().length > 0);
-                const els = [...document.querySelectorAll('div,span,button,[role=button]')];
-                // ① 停止生成按钮（生成期间出现）
-                const stopBtn = els.some(e => {
-                    if (inMd(e) || !visible(e)) return false;
-                    const x = (e.innerText || '').trim();
-                    return x === '停止生成' || x === '停止' ||
-                           x === 'Stop generating' || x === 'Stop';
-                });
-                if (stopBtn) return false;
-                // ② 流式光标 / 生成中 / 思考中标记（仅可见元素）
-                const busy = [...document.querySelectorAll(
-                    '[class*="streaming"], [class*="generating"], [class*="typing"], ' +
-                    '[class*="cursor"], [class*="caret"], [class*="thinking"], .ds-loading'
-                )].some(e => visible(e));
-                if (busy) return false;
-                // ③ 输入区发送中状态
-                const sending = [...document.querySelectorAll(
-                    '[class*="sending"], [class*="send"][class*="loading"], [class*="loading-send"]'
-                )].some(e => visible(e));
-                if (sending) return false;
-                return true;
-            }"""
-        )
 
     # ── 图片上传 ──
 
