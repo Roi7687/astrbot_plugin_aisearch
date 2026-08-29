@@ -102,6 +102,8 @@ ipython_config.py
 # Plugin sensitive files
 auth_state.json
 qrcode.png
+conversations.json
+ais_tmp/
 #uv.lock
 
 # poetry

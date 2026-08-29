@@ -1,4 +1,4 @@
-aiohappyeyeballs==2.6.2
+aiohappyeyeballs==2.7.1
 aiohttp==3.13.5
 aiosignal==1.4.0
 annotated-doc==0.0.4
@@ -37,3 +37,4 @@ uvicorn==0.48.0
 wheel==0.46.3
 yarl==1.24.2
 markdownify==0.14.1
+Pillow>=10.0.0
