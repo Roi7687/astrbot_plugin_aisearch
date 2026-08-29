@@ -747,7 +747,7 @@ class DeepSeekSessionCore:
         # 对新回复做文本稳定检测（连续 9 秒无变化视为输出完成）
         previous_text = ""
         stable_count = 0
-        total_deadline = time.time() + 180
+        total_deadline = time.time() + 300  # 慢速网络/深度思考/长回答留足时间
         while True:
             try:
                 current_text = await new_answer.inner_text()
@@ -760,7 +760,12 @@ class DeepSeekSessionCore:
                 previous_text = current_text
 
             if stable_count >= STABLE_CHECKS:
-                break
+                # 文本已稳定：再确认页面无「生成中」标志（停止按钮/流式光标），
+                # 确保流式输出真正结束——深度思考或长回答中间停顿可能超过 9 秒，
+                # 仅靠文本稳定会提前返回半截答案。
+                if await self._is_generation_finished():
+                    break
+                stable_count = 0  # 仍在生成：重置稳定计数继续等待
             if time.time() > total_deadline:
                 break
             await asyncio.sleep(STABLE_INTERVAL)
@@ -775,6 +780,43 @@ class DeepSeekSessionCore:
 
         raw_html = await new_answer.inner_html()
         return md(raw_html, heading_style="ATX")
+
+    async def _is_generation_finished(self) -> bool:
+        """判断 DeepSeek 是否已停止生成（流式输出真正结束）。
+
+        负向信号（任一存在即视为仍在生成）：
+        ① 停止生成按钮（生成期间出现）；② 流式光标 / 生成中 / 思考中标记（可见）；
+        ③ 输入区发送中状态。
+        排除回答正文（.ds-markdown）与隐藏元素，避免回答内容或静态布局误触发。
+        """
+        return await self.page.evaluate(
+            """() => {
+                const inMd = e => !!(e.closest && e.closest('.ds-markdown'));
+                const visible = e => e.offsetParent !== null ||
+                                     (e.getClientRects && e.getClientRects().length > 0);
+                const els = [...document.querySelectorAll('div,span,button,[role=button]')];
+                // ① 停止生成按钮（生成期间出现）
+                const stopBtn = els.some(e => {
+                    if (inMd(e) || !visible(e)) return false;
+                    const x = (e.innerText || '').trim();
+                    return x === '停止生成' || x === '停止' ||
+                           x === 'Stop generating' || x === 'Stop';
+                });
+                if (stopBtn) return false;
+                // ② 流式光标 / 生成中 / 思考中标记（仅可见元素）
+                const busy = [...document.querySelectorAll(
+                    '[class*="streaming"], [class*="generating"], [class*="typing"], ' +
+                    '[class*="cursor"], [class*="caret"], [class*="thinking"], .ds-loading'
+                )].some(e => visible(e));
+                if (busy) return false;
+                // ③ 输入区发送中状态
+                const sending = [...document.querySelectorAll(
+                    '[class*="sending"], [class*="send"][class*="loading"], [class*="loading-send"]'
+                )].some(e => visible(e));
+                if (sending) return false;
+                return true;
+            }"""
+        )
 
     # ── 图片上传 ──
 
@@ -794,18 +836,117 @@ class DeepSeekSessionCore:
         await file_input.set_input_files(existing)
         logger.info(f"📤 [Session] 已注入 {len(existing)} 张图片，等待上传完成...")
 
-        # 等待 blob 缩略图出现（上传成功标志）
+        # 阶段 1：等待 blob 缩略图出现（文件已被读取并挂载到输入区）
+        thumbnails_ok = False
         for retry in range(3):
             ok = await self._wait_blob_thumbnails(len(existing), timeout=30)
             if ok:
-                await asyncio.sleep(1)
-                return
+                thumbnails_ok = True
+                break
             logger.warning(f"⚠️ [Session] 上传缩略图未出现（第 {retry + 1} 次），重试注入...")
             try:
                 await file_input.set_input_files(existing)
             except Exception:
                 pass
-        raise ConversationError("图片上传超时，请重试。")
+        if not thumbnails_ok:
+            raise ConversationError("图片上传超时，请重试。")
+
+        # 阶段 2（关键）：缩略图出现 ≠ 上传完成——慢速网络下文件可能仍在
+        # 上传到 DeepSeek 服务器，此时发送提问会导致 AI 收不到图片。
+        # 双路确认上传完成：上传网络请求全部响应 或 DOM 上传中标志消失。
+        finished = await self._wait_upload_finished(len(existing), timeout=90)
+        if not finished:
+            raise ConversationError("图片上传未完成（网络较慢或上传失败），请稍后重试。")
+        logger.info("✅ [Session] 图片上传完成，开始发送提问...")
+
+    async def _wait_upload_finished(self, count: int, timeout: float) -> bool:
+        """等待图片上传真正完成。
+
+        双路确认：
+        ① 监听上传网络请求（POST/PUT 且 URL 含 upload/file），等待全部响应完成；
+        ② 兜底：DOM 上传中标志（进度条 / 百分比 / uploading 类）消失。
+        """
+        net_ok = await self._wait_upload_network_done(count, timeout=timeout)
+        if net_ok:
+            await asyncio.sleep(1)  # 让 UI 完成附件挂载
+            return True
+        dom_ok = await self._wait_no_upload_marker(timeout=30)
+        if dom_ok:
+            await asyncio.sleep(1)
+            return True
+        return False
+
+    async def _wait_upload_network_done(self, count: int, timeout: float) -> bool:
+        """监听上传网络请求（POST/PUT 且 URL 含 upload/file），等待全部完成"""
+        done_count = 0
+        done_event = asyncio.Event()
+
+        def is_upload_request(req) -> bool:
+            try:
+                if req.method not in ("POST", "PUT"):
+                    return False
+                url = (req.url or "").lower()
+                return "upload" in url or "/file" in url or "/files" in url
+            except Exception:
+                return False
+
+        def on_response(resp):
+            nonlocal done_count
+            try:
+                if is_upload_request(resp.request):
+                    done_count += 1
+                    if done_count >= count:
+                        done_event.set()
+            except Exception:
+                pass
+
+        def on_request_failed(req):
+            nonlocal done_count
+            try:
+                if is_upload_request(req):
+                    done_count += 1
+                    if done_count >= count:
+                        done_event.set()
+            except Exception:
+                pass
+
+        self.page.on("response", on_response)
+        self.page.on("requestfailed", on_request_failed)
+        try:
+            await asyncio.wait_for(done_event.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
+        finally:
+            self.page.remove_listener("response", on_response)
+            self.page.remove_listener("requestfailed", on_request_failed)
+
+    async def _wait_no_upload_marker(self, timeout: float) -> bool:
+        """兜底检测：页面无上传中标志（进度条 / 百分比 / uploading 类，排除回答正文）"""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            ok = await self.page.evaluate(
+                """() => {
+                    const inMd = e => !!(e.closest && e.closest('.ds-markdown'));
+                    const els = [...document.querySelectorAll('div,span')];
+                    // 上传进度 class（uploading / progress 且与上传相关）
+                    const busyClass = els.some(e => {
+                        if (inMd(e)) return false;
+                        const c = '' + e.className;
+                        return /uploading|is-uploading|upload-progress|uploading-progress/.test(c);
+                    });
+                    // 百分比文本（如 45%），排除回答正文
+                    const busyPct = els.some(e => {
+                        if (inMd(e)) return false;
+                        return /^\\s*\\d{1,3}%\\s*$/.test(e.innerText || '');
+                    });
+                    return !(busyClass || busyPct);
+                }"""
+            )
+            if ok:
+                return True
+            await asyncio.sleep(0.5)
+        return False
 
     async def _wait_blob_thumbnails(self, count: int, timeout: float) -> bool:
         deadline = time.time() + timeout
