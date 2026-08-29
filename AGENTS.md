@@ -145,7 +145,7 @@ astrbot_plugin_aisearch/
 | playwright | 1.60.0 | 底层浏览器自动化引擎 |
 | markdownify | 0.14.1 | HTML → Markdown |
 | httpx | 0.28.1 | 图片下载等 HTTP 客户端 |
-| Pillow | ≥10.0（可选） | 图片压缩（缺失时跳过压缩） |
+| Pillow | ≥11.2.1（可选，AstrBot 核心自带） | 图片压缩（缺失时跳过压缩） |
 
 ---
 
