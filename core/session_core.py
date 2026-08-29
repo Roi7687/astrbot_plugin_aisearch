@@ -724,14 +724,56 @@ class DeepSeekSessionCore:
             baseline = await answer_locator.count()
 
         new_answer = None
-        deadline = time.time() + 60
+        deadline = time.time() + 180  # 慢速网络 + 深度思考 + 联网搜索：回答可能超过 60 秒才开始输出
+        last_send_check = 0.0
+        send_fail_count = 0
         while time.time() < deadline:
             current = await answer_locator.count()
             if current > baseline:
                 new_answer = answer_locator.nth(baseline)
                 break
+            # 每 5 秒确认消息是否真的已发出（输入框已清空）：
+            # 若未清空说明 Enter 发送失败，补点发送按钮；连续 3 次仍失败则提前报错，
+            # 避免消息根本没发出去却干等超时
+            if time.time() - last_send_check >= 5:
+                last_send_check = time.time()
+                try:
+                    ta_value = await self.page.evaluate(
+                        "() => { const ta = document.querySelector('textarea'); return ta ? ta.value : ''; }"
+                    )
+                except Exception:
+                    ta_value = ""
+                if ta_value:
+                    send_fail_count += 1
+                    logger.info(
+                        f"⚠️ [Session] 输入框未清空，消息可能未发出（第 {send_fail_count} 次），补点发送按钮..."
+                    )
+                    try:
+                        send_btn = await self._locate_by_text(
+                            (
+                                "div[role=button].ds-button--primary",
+                                "div[role=button]",
+                                "button",
+                            ),
+                            "发送",
+                            visible_timeout=3.0,
+                        )
+                        if send_btn is not None:
+                            await send_btn.click()
+                    except Exception:
+                        pass
+                    if send_fail_count >= 3:
+                        raise ConversationError("消息发送失败，请检查登录状态后重试。")
             await asyncio.sleep(0.5)
         if new_answer is None:
+            # 超时留档：输出页面文本片段与输入框状态，便于排查
+            try:
+                snippet = await self.page.evaluate(
+                    "() => (document.body.innerText || '').slice(0, 300).replace(/\\s+/g, ' ')"
+                )
+                logger.warning(f"⚠️ [Session] 等待 AI 回答超时。页面文本: {snippet}")
+            except Exception:
+                pass
             raise ConversationError("等待 AI 回答超时，请稍后重试。")
 
         # 对新回复做文本稳定检测（连续 9 秒无变化视为输出完成）
