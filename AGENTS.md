@@ -1,7 +1,7 @@
 # astrbot_plugin_aisearch 开发文档
 
 > **插件名称**：AI搜索  
-> **版本**：v2.1.1  
+> **版本**：v2.2.0  
 > **作者**：Roi  
 > **许可证**：AGPL-3.0  
 > **仓库地址**：https://github.com/Roi7687/astrbot_plugin_aisearch  
@@ -19,6 +19,8 @@
 **v2.1.0 变更**：会话模型由「双槽位」升级为「**多会话 + 本地 id**」——`/ais session` 与 `/ais list` 合并为 `/ais list`；每个会话由本地递增 id（1、2、3...）标识，`/ais list` 展示带 id 的会话列表，`/ais switch <id>` / `/ais list <id>` 按 id 切换；`/ais new` 不再销毁旧会话，旧会话保留在列表中可随时切回；已关闭的会话按 id 切换时自动重建；空闲计时器与主动通知改为按会话 id 索引。
 
 **v2.1.1 变更**：修复 Linux 服务器（英文系统）上识图模式报「未找到「识图模式」入口」的问题——浏览器启动/上下文强制 `locale=zh-CN`（`--lang` + Playwright context locale），保证 DeepSeek 恒为中文 UI；识图入口查找升级为多策略（中/英文精确标签 → 模糊文本 → 展开「+ / 更多」菜单），失败时保存 `vision_debug.png` 截图与页面文本留档。
+
+**v2.2.0 变更**：① **自动触发**——@机器人（或私聊）直接发文字/图片即可自动进入 AI 搜索对话，无需 `/ais` 指令；仅切换/新建会话时使用指令（`AUTO_TRIGGER` 可关）；② **固定启用深度思考 + 联网搜索**——每次发送前自动确保两个模式开关开启（幂等检测激活态，`ALWAYS_DEEP_THINK` / `ALWAYS_WEB_SEARCH` 可配）；③ **修复连续对话返回旧结果**——回答定位从「最后一回复块」改为「发送前回复块计数基线 + 定位新回复块」，避免上一轮回复或用户消息被误判为最新回答。
 
 ---
 
@@ -58,6 +60,8 @@ astrbot_plugin_aisearch/
 | `CONVERSATIONS_FILE` | 会话元数据持久化路径（conversations.json） |
 | `IDLE_TIMEOUT_SECONDS` | 会话空闲自动销毁时间（默认 300 秒） |
 | `MAX_IMAGE_BYTES` | 单张图片大小上限（超过自动压缩） |
+| `ALWAYS_DEEP_THINK` / `ALWAYS_WEB_SEARCH` | 固定开启「深度思考」/「联网搜索」（默认 True） |
+| `AUTO_TRIGGER` | 自动触发：@机器人/私聊直接提问无需 /ais（默认 True） |
 | `DEFAULT_VISION_PROMPT` | 仅发图不带文字时的默认提问 |
 | `VISION_WELCOME_TEXT` | 识图模式新会话欢迎语（用于验证切换成功） |
 | `MODE_NORMAL` / `MODE_VISION` | 会话模式常量（normal / vision） |
@@ -105,7 +109,8 @@ astrbot_plugin_aisearch/
 - **已销毁会话重建**：按 id 切换到 `destroyed=True` 的会话时，同模式重建并保留原 id
 - **识图模式切换**：新对话页点击「识图模式」入口（精确标签 → 模糊文本 → 展开「+ / 更多」菜单多策略查找，中/英文标签均支持），以欢迎语「使用识图模式开始对话」或激活态类名验证；查找失败时保存 vision_debug.png 截图留档
 - **图片上传**：Playwright `set_input_files` 注入 `input[type=file]`，以 `img[src^="blob:"]` 缩略图出现作为上传成功标志
-- **答案等待**：文本稳定检测（连续 9 秒无变化），保留引用角标清理与 HTML→Markdown 转换
+- **固定启用模式开关**：`_ensure_toggle_on(label)` 幂等开启「深度思考」/「联网搜索」（检测 active/selected/aria-checked 激活态，已开启不重复点击，避免切换类 bug）
+- **答案等待**：发送前记录助手回复块数量为基线 → 等待块数超过基线定位「新回复」→ 对新回复做文本稳定检测（连续 9 秒无变化，总上限 180 秒）；避免旧回复/用户消息被误判为最新结果；保留引用角标清理与 HTML→Markdown 转换
 - **会话删除**：`POST /api/v0/chat_session/delete`（Bearer 令牌嗅探），新旧 URL 格式（`/a/chat/s/<uuid>` 与 `/s/<id>`）均兼容
 - **元数据持久化**：每次变更写入 conversations.json（`{"next_id", "current_id", "conversations"}` 新格式；旧版 `{mode: {...}}` 双槽位格式自动迁移为 id 1=normal、2=vision）
 
@@ -116,6 +121,8 @@ astrbot_plugin_aisearch/
 | `CloakSearchPlugin` | 插件主类 |
 | `ai_search_command()` | `/ais` 统一指令（send/new/session/list/switch/help） |
 | `on_image_message()` | `@filter.event_message_type(ALL)` 图片消息处理：@机器人 + 图片（或私聊图片）→ 识图会话 |
+| `on_auto_message()` | `@filter.event_message_type(ALL)` 自动触发：@机器人/私聊文本（非指令、非图片）→ 直接 AI 搜索对话，无需 /ais |
+| `_respond()` | 统一回复：记录通知来源 + 刷新空闲计时 + 「已开启新会话」前缀 + 键盘按钮；返回空串表示已发送 |
 | `_arm_idle_timer()` / `_idle_waiter()` | 每会话独立空闲计时器，超时销毁 + 主动通知 |
 | `_record_notice_source()` / `_notify()` | 记录消息来源；主动推送（QQ 官方走 bot API，其余走 `context.send_message`） |
 | `_collect_images()` | 兼容新旧 AstrBot API 提取图片组件 |
@@ -165,13 +172,31 @@ astrbot_plugin_aisearch/
 
 ## 五、数据流
 
-### 文本提问（/ais）
+### 自动触发（@机器人/私聊文本，v2.2.0 新增）
 
 ```
-用户发送 /ais 问题
+用户 @机器人 发送文字（或私聊直接发送）
        │
        ▼
-  ai_search_command() → parse_ais_command()
+  on_auto_message()（EventMessageType.ALL）
+       ├─ AUTO_TRIGGER 关闭 / 事件已停止 → 返回
+       ├─ 空文本 / 以 / 开头（指令） → 返回
+       ├─ 含图片 → 返回（交给 on_image_message 识图）
+       ├─ 群聊未@未唤醒 → 返回（不拦截正常聊天）
+       └─ 命中 → event.stop_event()（阻止默认 LLM 响应）
+       ▼
+  session.send_message(text) → (created, result)
+       ▼
+  _respond()：记录通知来源 + 刷新空闲计时 + 前缀 + 键盘按钮 → 回复
+```
+
+### 文本提问（/ais 或自动触发）
+
+```
+用户发送提问（/ais 问题 或 @机器人 问题）
+       │
+       ▼
+  ai_search_command() / on_auto_message()
        │  send: mode = -v ? "vision" : None（保持当前会话）
        ▼
   DeepSeekSessionCore.send_message(text, thinking, mode) → (created, result)
@@ -183,12 +208,13 @@ astrbot_plugin_aisearch/
        │                          ├─ _open_new_chat()（新对话页）
        │                          └─ vision？ _switch_to_vision()（点击识图模式）
        │
-       ├─ _toggle_thinking() + 输入 + Enter/按钮发送
-       ├─ 文本稳定检测（9s 无变化）→ HTML → Markdown
+       ├─ _ensure_toggle_on(深度思考/联网搜索)（固定开启，幂等）
+       ├─ 输入 + Enter/按钮发送
+       ├─ 等待新回复块（基线计数）→ 文本稳定检测（9s 无变化）→ HTML → Markdown
        └─ _mark_active(conv)（消息数+1，刷新空闲计时，回写真实 URL/id）
        │
        ▼
-  返回结果（created 时前缀「🟢 已开启新的…（会话 #id）」；QQ 官方附带键盘按钮）
+  _respond()（created 时前缀「🟢 已开启新的…（会话 #id）」；QQ 官方附带键盘按钮）
        │
        ▼
   _arm_idle_timer(local_id) → 300s 无活动 → destroy + 主动通知
@@ -211,7 +237,7 @@ astrbot_plugin_aisearch/
        ├─ set_input_files 上传 → 等 blob 缩略图
        └─ 输入文字（无则默认提示词）→ 发送 → 等待答案
        ▼
-  返回结果 + 键盘按钮
+  _respond() → 返回结果 + 键盘按钮
 ```
 
 ---
@@ -259,6 +285,16 @@ astrbot_plugin_aisearch/
 | 新对话页就绪等待 | ✅ | `_open_new_chat` 等待 textarea 可见，慢速服务器下不再因页面未渲染完而误报 |
 | 单元测试 | ✅ | 33 用例 + 会话核心 mock 测试全部通过（测试运行时会临时隔离真实 conversations.json） |
 
+### ✅ v2.2.0 已完成功能
+
+| 功能 | 状态 | 说明 |
+|------|------|------|
+| 自动触发 | ✅ | @机器人/私聊文本自动进入 AI 搜索对话（on_auto_message，AUTO_TRIGGER 可关）；跳过指令与图片消息；未@群聊消息不拦截 |
+| 固定启用深度思考+联网搜索 | ✅ | `_ensure_toggle_on` 幂等开启（检测激活态），ALWAYS_DEEP_THINK / ALWAYS_WEB_SEARCH 可配 |
+| 修复连续对话返回旧结果 | ✅ | 回答定位改为「发送前回复块计数基线 + 定位新回复块」，普通/识图模式共用修复 |
+| 统一回复逻辑 | ✅ | `_respond()` 收敛三处重复的回复代码（指令/自动触发/识图） |
+| 帮助文案 | ✅ | /ais help 与 usage 同步更新自动触发说明 |
+
 ### ⚠️ 已知问题 / 待改进
 
 - **UI 依赖**：识图模式入口、上传输入框等选择器基于 2026-06 上线的 DeepSeek 网页版 UI，改版后需更新 `session_core.py`
@@ -278,15 +314,15 @@ astrbot_plugin_aisearch/
 ## 七、安装与使用
 
 1. 首次使用前，发送 `/cloak登录` 微信扫码登录
-2. **提问**：`/ais [-t] <问题>`；**识图**：`/ais -v <问题>` 或群聊 @机器人 + 图片
-3. **会话管理**：`/ais list` 查看全部会话（带本地 id）；`/ais switch <id>` 按 id 切换；`/ais new` 开启新会话（旧会话保留）
-4. 示例：
-   - `/ais 今天有什么大新闻`
-   - `/ais -t 解释量子纠缠的原理`（深度思考）
+2. **提问**：@机器人 直接发消息（或私聊直接发）即可自动提问，无需指令；`/ais <问题>` 亦可
+3. **识图**：@机器人 + 图片（或私聊发图）自动进入识图会话
+4. **会话管理**（仅切换时需要指令）：`/ais list` 查看全部会话（带本地 id）；`/ais switch <id>` 按 id 切换；`/ais new` 开启新会话（旧会话保留）
+5. 示例：
+   - @机器人 今天有什么大新闻（自动触发，深度思考+联网搜索固定开启）
    - 群里 @机器人 发一张截图 → 自动识图分析
-   - `/ais list` → `/ais switch 2` → `/ais 这张图里有什么公式`
-5. 空闲 300 秒无活动，会话自动关闭并收到通知；已关闭的会话按 id 切换时自动重建
+   - `/ais list` → `/ais switch 2` → @机器人 这张图里有什么公式
+6. 空闲 300 秒无活动，会话自动关闭并收到通知；已关闭的会话按 id 切换时自动重建
 
 ---
 
-*文档更新日期：2026-08-29（v2.1.1）*
+*文档更新日期：2026-08-29（v2.2.0）*

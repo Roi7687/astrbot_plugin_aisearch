@@ -21,6 +21,8 @@ from markdownify import markdownify as md
 from cloakbrowser import launch_async
 
 from .config import (
+    ALWAYS_DEEP_THINK,
+    ALWAYS_WEB_SEARCH,
     BROWSER_LOCALE,
     BROWSER_TIMEZONE,
     CONVERSATIONS_FILE,
@@ -626,17 +628,33 @@ class DeepSeekSessionCore:
 
     # ── 消息发送与等待 ──
 
-    async def _toggle_thinking(self, enable: bool):
-        """尝试开启/关闭 DeepSeek 深度思考模式"""
-        if not enable:
-            return
+    async def _ensure_toggle_on(self, label: str) -> bool:
+        """确保指定名称的模式开关（「深度思考」/「联网搜索」）处于开启状态（幂等）。
+
+        先检查开关的激活态（active/selected/aria-checked），未开启才点击，
+        避免「已开启时再点一次反而关闭」的切换类 bug。
+        """
         try:
-            btn = self.page.locator(".ds-toggle-button").filter(has_text="深度思考")
-            await btn.wait_for(state="visible", timeout=30000)
-            await btn.click()
-            await asyncio.sleep(1)
-        except Exception:
-            pass
+            btn = self.page.locator(".ds-toggle-button").filter(has_text=label).first
+            await btn.wait_for(state="visible", timeout=15000)
+            active = await btn.evaluate(
+                """(el) => {
+                    const c = '' + el.className;
+                    if (c.indexOf('active') >= 0 || c.indexOf('selected') >= 0 ||
+                        c.indexOf('checked') >= 0) return true;
+                    const aria = el.getAttribute('aria-checked') || el.getAttribute('aria-pressed');
+                    if (aria === 'true') return true;
+                    return false;
+                }"""
+            )
+            if not active:
+                await btn.click()
+                await asyncio.sleep(0.8)
+                logger.info(f"🔛 [Session] 已开启「{label}」")
+            return True
+        except Exception as e:
+            logger.warning(f"⚠️ [Session] 未能确认「{label}」开关状态: {e}")
+            return False
 
     async def _type_and_send(self, text: str):
         """在输入框中输入文本并发送（Enter 优先，按钮兜底）"""
@@ -679,8 +697,19 @@ class DeepSeekSessionCore:
         return False
 
     async def _send_query(self, text: str, thinking: bool) -> str:
-        """在当前页面发送提问并等待回答（不含会话状态维护）"""
-        await self._toggle_thinking(thinking)
+        """在当前页面发送提问并等待回答（不含会话状态维护）。
+
+        回答定位策略：发送前记录页面中已有助手回复块数量作为基线，
+        发送后等待回复块数**超过基线**（真正出现了新回复），
+        再对「第 baseline 条」新回复做文本稳定检测——避免上一轮回复
+        （或兜底选择器误匹配到的用户消息）被当成最新结果返回。
+        """
+        # 固定开启深度思考 / 联网搜索（幂等：已开启不会重复点击）
+        if ALWAYS_DEEP_THINK or thinking:
+            await self._ensure_toggle_on("深度思考")
+        if ALWAYS_WEB_SEARCH:
+            await self._ensure_toggle_on("联网搜索")
+
         await self._type_and_send(text)
 
         # 发送后的快速错误检测
@@ -694,19 +723,36 @@ class DeepSeekSessionCore:
         if rejected:
             return "⚠️ DeepSeek 拒绝了这条消息（内容违反使用规范或发送失败），请调整后重试。"
 
+        # 以发送前的回复块数量为基线，定位「新回复」
         answer_locator = self.page.locator(
             "div.ds-markdown.ds-assistant-message-main-content"
         )
-        try:
-            await answer_locator.last.wait_for(state="visible", timeout=30000)
-        except Exception:
+        baseline = await answer_locator.count()
+        if baseline == 0:
             # UI 变动兜底：退回通用 .ds-markdown 选择器
             answer_locator = self.page.locator(".ds-markdown")
+            baseline = await answer_locator.count()
 
+        new_answer = None
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            current = await answer_locator.count()
+            if current > baseline:
+                new_answer = answer_locator.nth(baseline)
+                break
+            await asyncio.sleep(0.5)
+        if new_answer is None:
+            raise ConversationError("等待 AI 回答超时，请稍后重试。")
+
+        # 对新回复做文本稳定检测（连续 9 秒无变化视为输出完成）
         previous_text = ""
         stable_count = 0
+        total_deadline = time.time() + 180
         while True:
-            current_text = await answer_locator.last.inner_text()
+            try:
+                current_text = await new_answer.inner_text()
+            except Exception:
+                current_text = ""
             if current_text == previous_text and len(current_text) > 0:
                 stable_count += 1
             else:
@@ -714,6 +760,8 @@ class DeepSeekSessionCore:
                 previous_text = current_text
 
             if stable_count >= STABLE_CHECKS:
+                break
+            if time.time() > total_deadline:
                 break
             await asyncio.sleep(STABLE_INTERVAL)
 
@@ -725,7 +773,7 @@ class DeepSeekSessionCore:
         except Exception as e:
             logger.warning(f"⚠️ [Session] 清理 DOM 引用角标异常: {e}")
 
-        raw_html = await answer_locator.last.inner_html()
+        raw_html = await new_answer.inner_html()
         return md(raw_html, heading_style="ATX")
 
     # ── 图片上传 ──

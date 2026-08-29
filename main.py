@@ -13,6 +13,7 @@ from astrbot.core.star.filter.command import GreedyStr
 
 from .core.command_parser import parse_ais_command
 from .core.config import (
+    AUTO_TRIGGER,
     QR_FILE,
     IDLE_TIMEOUT_SECONDS,
     MAX_IMAGE_BYTES,
@@ -123,25 +124,8 @@ class CloakSearchPlugin(Star):
         thinking = payload["thinking"]
         try:
             created, result = await self.session.send_message(text, thinking, mode)
-            conv = self.session.current_conversation
-            conv_id = conv.local_id if conv else 0
-            self._record_notice_source(conv_id, event)
-            self._arm_idle_timer(conv_id)
-
-            prefix = ""
-            if created and conv:
-                prefix = (
-                    f"🟢 已开启新的{MODE_LABELS.get(conv.mode, conv.mode)}"
-                    f"（会话 #{conv.local_id}）。\n\n"
-                )
-            result = prefix + result
-            kb = self._build_keyboard(
-                ("💬 继续对话", "/ais "),
-                ("🧠 深度对话", "/ais -t "),
-                ("🖼 识图对话", "/ais -v "),
-                ("🔀 切换会话", "/ais switch"),
-            )
-            if not await self._try_send_with_keyboard(event, result, kb):
+            result = await self._respond(event, created, result)
+            if result:
                 yield event.plain_result(result)
         except AuthError:
             yield event.plain_result(self._auth_error_text())
@@ -177,22 +161,8 @@ class CloakSearchPlugin(Star):
                 return
 
             created, result = await self.session.send_image_message(text, paths)
-            conv = self.session.current_conversation
-            conv_id = conv.local_id if conv else 0
-            self._record_notice_source(conv_id, event)
-            self._arm_idle_timer(conv_id)
-
-            prefix = ""
-            if created and conv:
-                prefix = f"🟢 已开启新的识图对话（会话 #{conv.local_id}）。\n\n"
-            result = prefix + result
-            kb = self._build_keyboard(
-                ("💬 继续对话", "/ais "),
-                ("🧠 深度对话", "/ais -t "),
-                ("🖼 识图对话", "/ais -v "),
-                ("🔀 切换会话", "/ais switch"),
-            )
-            if not await self._try_send_with_keyboard(event, result, kb):
+            result = await self._respond(event, created, result)
+            if result:
                 yield event.plain_result(result)
         except AuthError:
             yield event.plain_result(self._auth_error_text())
@@ -200,6 +170,70 @@ class CloakSearchPlugin(Star):
             yield event.plain_result(f"❌ 识图失败: {e}")
         except Exception as e:
             yield event.plain_result(f"❌ 识图失败: {e}")
+
+    # ═════════════════════ 自动触发：@机器人/私聊文本消息 ═════════════════════
+
+    @filter.event_message_type(EventMessageType.ALL)
+    async def on_auto_message(self, event: AstrMessageEvent):
+        """@机器人（或私聊）发送文本 → 自动进入 AI 搜索对话，无需 /ais 指令。
+
+        仅在需要切换/新建会话时才使用 /ais switch、/ais new 等指令。
+        跳过：指令消息（/ 开头或 AstrBot 识别为指令）、图片消息（交给识图）。
+        """
+        if not AUTO_TRIGGER or event.is_stopped():
+            return
+
+        text = self._clean_image_text(event.get_message_str() or "")
+        if not text:
+            return
+        if text.startswith("/"):
+            return  # 指令消息（/ais、/cloak登录 等）由对应指令处理器处理
+        if await self._collect_images(event):
+            return  # 图片消息交给 on_image_message（识图模式）
+
+        # 群聊需要 @ 机器人或唤醒词；私聊直接触发
+        is_at = getattr(event, "is_at_or_wake_command", False) or event.is_private_chat()
+        if not is_at:
+            return
+
+        event.stop_event()  # 阻止默认 LLM 响应
+
+        try:
+            created, result = await self.session.send_message(text)
+            result = await self._respond(event, created, result)
+            if result:
+                yield event.plain_result(result)
+        except AuthError:
+            yield event.plain_result(self._auth_error_text())
+        except ConversationError as e:
+            yield event.plain_result(f"❌ 搜索失败: {e}")
+        except Exception as e:
+            yield event.plain_result(f"❌ 搜索失败: {e}")
+
+    # ═════════════════════ 统一回复 ═════════════════════
+
+    async def _respond(self, event: AstrMessageEvent, created: bool, result: str) -> str:
+        """统一回复 AI 搜索结果：记录通知来源 / 刷新空闲计时，
+        附「已开启新会话」前缀与键盘按钮。
+        返回最终文本；已通过键盘消息发送时返回空串（调用方无需再 yield）。"""
+        conv = self.session.current_conversation
+        conv_id = conv.local_id if conv else 0
+        self._record_notice_source(conv_id, event)
+        self._arm_idle_timer(conv_id)
+        if created and conv:
+            result = (
+                f"🟢 已开启新的{MODE_LABELS.get(conv.mode, conv.mode)}"
+                f"（会话 #{conv.local_id}）。\n\n{result}"
+            )
+        kb = self._build_keyboard(
+            ("💬 继续对话", "/ais "),
+            ("🧠 深度对话", "/ais -t "),
+            ("🖼 识图对话", "/ais -v "),
+            ("🔀 切换会话", "/ais switch"),
+        )
+        if await self._try_send_with_keyboard(event, result, kb):
+            return ""
+        return result
 
     # ═════════════════════ 空闲超时与主动通知 ═════════════════════
 
@@ -509,8 +543,9 @@ class CloakSearchPlugin(Star):
     def _usage_text() -> str:
         return (
             "⚠️ 用法：\n"
+            "• 直接发送消息（@机器人 或私聊）即可自动联网提问，无需指令\n"
             "• /ais <问题> — 在当前会话提问\n"
-            "• /ais -t <问题> — 开启深度思考\n"
+            "• /ais -t <问题> — 强制开启深度思考\n"
             "• /ais -v <问题> — 切到识图会话提问\n\n"
             "📌 管理：/ais list（列表） ｜ /ais switch <id>（切换） ｜ "
             "/ais new（新建） ｜ /ais help（帮助）"
@@ -520,9 +555,14 @@ class CloakSearchPlugin(Star):
     def _help_text() -> str:
         return (
             "🔍 AI搜索插件 帮助\n\n"
+            "⚡ 自动触发：\n"
+            "• 群聊中 @机器人 发送文字（或私聊直接发送）→ 自动联网提问，无需 /ais 指令\n"
+            "• 群聊中 @机器人 发送图片 → 自动进入识图模式\n"
+            "• 深度思考与联网搜索默认固定开启\n"
+            "• 仅切换/新建会话时才需要指令（/ais switch、/ais new）\n\n"
             "📋 统一指令 /ais（别名：搜索）：\n"
             "• /ais <问题> — 在当前会话联网提问（无会话自动创建）\n"
-            "• /ais -t <问题> — 开启深度思考模式\n"
+            "• /ais -t <问题> — 强制开启深度思考模式\n"
             "• /ais -v <问题> — 切到「识图模式」会话提问（无则自动创建）\n"
             "• /ais new（或 reset/重置）— 开启新会话，旧会话保留在列表中\n"
             "• /ais list（或 列表/状态/session）— 查看全部会话（带本地 id，👉 为当前）\n"
@@ -536,7 +576,7 @@ class CloakSearchPlugin(Star):
             "已关闭的会话按 id 切换时会自动重建。\n\n"
             "📌 其他：\n"
             "• /cloak登录 — 微信扫码登录 DeepSeek\n"
-            "• 示例：/ais 今天有什么大新闻\n"
+            "• 示例：@机器人 今天有什么大新闻\n"
             "  /ais -t 解释量子纠缠的原理\n"
             "  /ais -v 帮我看看这张图的配色\n"
             "  /ais list\n"
