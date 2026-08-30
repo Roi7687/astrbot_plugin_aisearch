@@ -63,7 +63,7 @@ class Conversation:
     message_count: int = 0          # 用户已发送消息数
     created_at: float = 0.0
     last_active: float = 0.0
-    destroyed: bool = False         # True 表示已销毁（超时），按 id 切换时会重建
+    destroyed: bool = False         # 历史兼容：v2.2.11 起销毁即删除记录，此字段仅短暂用于页面失效重建路径
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -105,7 +105,7 @@ class DeepSeekSessionCore:
         return conv.mode if conv else MODE_NORMAL
 
     async def send_message(
-        self, text: str, thinking: bool = False, mode: str | None = None
+        self, text: str, mode: str | None = None
     ) -> tuple[bool, str]:
         """在当前会话（或指定模式会话）发送文本消息。
 
@@ -116,12 +116,12 @@ class DeepSeekSessionCore:
         async with self.lock:
             self._check_closing()
             conv, created = await self.ensure_current_locked(mode)
-            result = await self._send_query(text, thinking)
+            result = await self._send_query(text)
             self._mark_active(conv)
             return created, result
 
     async def send_image_message(
-        self, text: str, image_paths: list, thinking: bool = False
+        self, text: str, image_paths: list
     ) -> tuple[bool, str]:
         """上传图片到**全新的识图会话**并发送提问。返回 (是否新建了会话, 回答文本)。
 
@@ -135,7 +135,7 @@ class DeepSeekSessionCore:
             conv = await self._create_conversation(MODE_VISION)
             self._register(conv)
             await self._upload_images(image_paths)
-            result = await self._send_query(text or DEFAULT_VISION_PROMPT, thinking)
+            result = await self._send_query(text or DEFAULT_VISION_PROMPT)
             self._mark_active(conv)
             return True, result
 
@@ -147,7 +147,7 @@ class DeepSeekSessionCore:
             return await self.ensure_current_locked(mode)
 
     async def switch_conversation(self, local_id: int) -> tuple[Conversation, bool]:
-        """按本地 id 切换会话；id 不存在报错，已销毁则同模式重建。
+        """按本地 id 切换会话；id 不存在（含已销毁被移除记录）报错。
         返回 (会话, 是否重建了会话)。"""
         async with self.lock:
             self._check_closing()
@@ -156,17 +156,6 @@ class DeepSeekSessionCore:
                 raise ConversationError(
                     f"找不到会话 #{local_id}，请先发送 /ais list 查看可用会话。"
                 )
-            if conv.destroyed:
-                new_conv = await self._create_conversation(conv.mode)
-                new_conv.local_id = conv.local_id
-                new_conv.created_at = conv.created_at
-                self.conversations[local_id] = new_conv
-                self.current_id = local_id
-                self._save_conversations()
-                logger.info(
-                    f"🔀 [Session] 会话 #{local_id} 已关闭，已重建新的{MODE_LABELS.get(conv.mode, conv.mode)}。"
-                )
-                return new_conv, True
             try:
                 await self._goto_session(conv)
             except ConversationError:
@@ -194,16 +183,23 @@ class DeepSeekSessionCore:
             return conv
 
     async def destroy_conversation(self, local_id: int) -> bool:
-        """销毁指定会话（空闲超时调用）。返回是否真的有会话被销毁"""
+        """销毁指定会话（空闲超时调用）：服务器端删除 + 本地记录一并移除。
+
+        v2.2.11 起不再保留已销毁的记录（用户无法再访问，且避免
+        conversations.json 无限膨胀）；销毁的是当前会话时重置 current_id。
+        返回是否真的有会话被销毁。
+        """
         async with self.lock:
             conv = self.conversations.get(local_id)
             if not conv or conv.destroyed:
                 return False
             await self._delete_session_best_effort(conv)
-            conv.destroyed = True
+            del self.conversations[local_id]
+            if self.current_id == local_id:
+                self.current_id = None
             self._save_conversations()
             logger.info(
-                f"⏳ [Session] 会话 #{local_id}（{MODE_LABELS.get(conv.mode, conv.mode)}）已销毁。"
+                f"⏳ [Session] 会话 #{local_id}（{MODE_LABELS.get(conv.mode, conv.mode)}）已销毁并移除记录。"
             )
             return True
 
@@ -310,8 +306,15 @@ class DeepSeekSessionCore:
                     self.current_id = max(alive, key=lambda c: c.last_active).local_id
                 if self.conversations:
                     logger.info("📂 [Session] 已迁移旧版双槽位会话数据为本地 id 索引。")
+            # v2.2.11 起销毁即删除记录：清理历史遗留的 destroyed 数据并立即落盘
+            stale = [i for i, c in self.conversations.items() if c.destroyed]
+            for i in stale:
+                del self.conversations[i]
             if self.current_id not in self.conversations:
                 self.current_id = None
+            if stale:
+                self._save_conversations()
+                logger.info(f"🧹 [Session] 已清理 {len(stale)} 条已销毁的会话记录。")
             logger.info(
                 f"📂 [Session] 已加载会话元数据: {len(self.conversations)} 个会话（下一个 id={self.next_id}）"
             )
@@ -696,14 +699,14 @@ class DeepSeekSessionCore:
             await asyncio.sleep(0.4)
         return False
 
-    async def _send_query(self, text: str, thinking: bool) -> str:
+    async def _send_query(self, text: str) -> str:
         """在当前页面发送提问并等待回答（不含会话状态维护）。
 
         等待策略（v2.2.7 回归简单版）：发送后等待对话框最后一条回复出现，
         随后对其做**文本稳定检测**（连续 9 秒无变化视为输出完成）。
         不做回复块计数 / 生成标志 / 补发重试等复杂判断，避免在部分环境下
         卡死或误判；保留 300 秒总上限防止异常情况下无限等待。
-        thinking 参数保留兼容但无实际作用（深度思考跟随 DeepSeek 网页端设置）。
+        深度思考 / 联网搜索跟随 DeepSeek 网页端设置（不自动操作开关）。
         """
         await self._type_and_send(text)
 

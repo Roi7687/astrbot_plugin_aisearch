@@ -186,7 +186,7 @@ class CloakSearchPlugin(Star):
         text = self._clean_image_text(event.get_message_str() or "")
         if not text:
             return
-        if text.startswith("/") or self._is_command_message(event):
+        if self._is_command_message(event):
             return  # 指令消息（/ais、/cloak登录 等）由对应指令处理器处理
         if await self._collect_images(event):
             return  # 图片消息交给 on_image_message（识图模式）

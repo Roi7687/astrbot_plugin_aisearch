@@ -43,19 +43,19 @@ async def main():
     ids = [it["local_id"] for it in core.list_summary()]
     assert ids == [1, 2], ids
 
-    # 5. 销毁后标记
+    # 5. 销毁后删除记录（v2.2.11 起不再保留已销毁会话）
     ok = await core.destroy_conversation(1)
     assert ok is True
-    assert core.conversations[1].destroyed is True
+    assert 1 not in core.conversations, "destroy removes record"
+    assert core.current_id is None, "destroy current resets"
     ok = await core.destroy_conversation(1)
     assert ok is False, "destroy twice"
 
-    # 6. 重启加载（新格式）
+    # 6. 重启加载（新格式；已销毁记录不保留）
     core2 = DeepSeekSessionCore()
-    assert core2.conversations[1].destroyed is True, "reload destroyed"
-    assert core2.conversations[1].message_count == 2
+    assert 1 not in core2.conversations, "reload drops destroyed"
     assert core2.conversations[2].mode == MODE_VISION
-    assert core2.current_id == 1, "reload current_id"
+    assert core2.current_id is None, "reload current_id"
 
     # 7. 旧版双槽位格式自动迁移为本地 id（normal=1, vision=2）
     write_conv_file({
@@ -74,6 +74,17 @@ async def main():
     assert core3.conversations[2].mode == MODE_VISION
     assert core3.next_id == 3, "next_id after migrate"
     assert core3.current_id == 2, "migrate picks latest alive"
+
+    # 7b. 旧格式中含已销毁槽位：迁移后清理（v2.2.11）
+    write_conv_file({
+        "normal": {"mode": "normal", "message_count": 1,
+                   "created_at": 1.0, "last_active": 1.0, "destroyed": True},
+        "vision": {"mode": "vision", "message_count": 1,
+                   "created_at": 2.0, "last_active": 2.0, "destroyed": False},
+    })
+    core3b = DeepSeekSessionCore()
+    assert set(core3b.conversations) == {2}, list(core3b.conversations)
+    assert core3b.current_id == 2, "migrate picks alive after cleanup"
 
     # 8. 会话 id 提取
     assert core._extract_session_id("https://chat.deepseek.com/a/chat/s/abc-123-456") == "abc-123-456"

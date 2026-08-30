@@ -10,17 +10,18 @@ CASES = [
     # 空输入 → usage
     ("", "usage", {}),
     ("   ", "usage", {}),
-    ("-t", "usage", {}),
-    ("-v -t", "usage", {}),
+    ("-v", "usage", {}),
 
     # 普通提问
     ("你好", "send", {"text": "你好"}),
     ("今天有什么大新闻", "send", {"text": "今天有什么大新闻"}),
-    # -t / -v 兼容旗标：剥离但无效果（v2.2.5 / v2.2.10 起）
-    ("-t 解释量子纠缠", "send", {"text": "解释量子纠缠"}),
+    # -v 兼容旗标：剥离但无效果（v2.2.10 起）
     ("-v 这张图", "send", {"text": "这张图"}),
-    ("-v -t 看图", "send", {"text": "看图"}),
     ("--vision 描述图片", "send", {"text": "描述图片"}),
+    # -t 已彻底不识别（v2.2.11 起），原样进入文本
+    ("-t", "send", {"text": "-t"}),
+    ("-v -t", "send", {"text": "-t"}),
+    ("-t 解释量子纠缠", "send", {"text": "-t 解释量子纠缠"}),
     # 未知旗标原样保留（当作普通问题的一部分）
     ("-x 自定义", "send", {"text": "-x 自定义"}),
 
@@ -30,19 +31,17 @@ CASES = [
     ("重置", "new", {}),
     ("新会话", "new", {}),
 
-    # list：session/状态 已合并进 list
+    # list：无参显示列表（v2.2.11 起 list <id> 便捷切换已移除，切换统一 /ais switch）
     ("list", "list", {}),
     ("列表", "list", {}),
     ("session", "list", {}),
     ("状态", "list", {}),
     ("sessions", "list", {}),
     ("会话列表", "list", {}),
-
-    # list 带 id / 模式 → 直接切换
-    ("list 2", "switch", {"local_id": 2}),
-    ("列表 3", "switch", {"local_id": 3}),
-    ("session 1", "switch", {"local_id": 1}),
-    ("list 识图", "switch", {"mode": "vision"}),
+    ("list 2", "list", {}),
+    ("列表 3", "list", {}),
+    ("session 1", "list", {}),
+    ("list 识图", "list", {}),
 
     # switch：按本地 id / 模式；无参或参数无效 → 显示列表
     ("switch", "switch", {}),
