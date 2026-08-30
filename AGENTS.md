@@ -1,7 +1,7 @@
 # astrbot_plugin_aisearch 开发文档
 
 > **插件名称**：AI搜索  
-> **版本**：v2.2.9  
+> **版本**：v2.2.10  
 > **作者**：Roi  
 > **许可证**：AGPL-3.0  
 > **仓库地址**：https://github.com/Roi7687/astrbot_plugin_aisearch  
@@ -40,6 +40,8 @@
 
 **v2.2.9 变更**：**每次传图新建识图会话**——多张图堆在同一个 DeepSeek 识图会话中易导致回复异常。`send_image_message` 改为每次上传都 `_create_conversation(MODE_VISION)` + `_register`（不可调用 `new_conversation()`，其内部持锁会死锁），不再复用旧识图会话；旧会话保留在列表中可按 id 切回，空闲超时自动销毁。
 
+**v2.2.10 变更**：**指令/列表体验清理**——① **`-v` 旗标移除语义**：带图消息（@机器人 + 图片 / 私聊发图）已自动新建识图会话，`/ais -v` 不再切换到识图模式；解析仍剥离 `-v`（避免旗标文本被当问题发送）但无效果，键盘按钮「🖼 识图对话」与 usage/help 文案同步移除；② **`/ais new` 总是新建普通会话**：不再继承上一轮会话的模式（上一轮为识图时新建识图会话没有意义）；③ **`/ais list` 改为紧凑 markdown 表格风格**：一行一个会话（`👉 1  普通对话 ｜ 3 条 ｜ 最后活跃 08-30 17:14`），去掉 # 号与多行提示；④ **已销毁（空闲超时关闭）的会话不再显示在列表中**——用户不会关心，仍可通过 `/ais switch <id>` 切换时自动重建。
+
 ---
 
 ## 二、项目结构
@@ -53,7 +55,7 @@ astrbot_plugin_aisearch/
 │   ├── session_core.py        # 统一持久化会话核心（多会话 + 本地 id 计数）
 │   └── login_core.py          # 登录模块：微信扫码登录 DeepSeek
 ├── tests/                     # 单元测试（mock 掉浏览器依赖）
-│   ├── test_command_parser.py      # 指令解析 33 用例
+│   ├── test_command_parser.py      # 指令解析 35 用例
 │   └── test_session_core_mock.py   # 会话核心 mock 测试（含旧数据迁移）
 ├── __init__.py                # 包初始化文件（空）
 ├── main.py                    # 插件主入口：命令注册、异步调度、主动通知
@@ -93,13 +95,13 @@ astrbot_plugin_aisearch/
 **返回的 action**：`usage` / `help` / `send` / `new` / `list` / `switch`
 
 **解析规则**：
-- 开头的 `-t` / `-v` 旗标（可组合，如 `-v -t`）
+- 开头的 `-t` / `-v` 兼容旗标（v2.2.5 / v2.2.10 起无实际效果，解析时剥离避免旗标文本被当问题发送）
 - 首个 token 命中子命令关键词表（含中文别名：重置/状态/列表/切换/帮助）→ 子命令
   - `session` / `状态` / `会话` / `info` / `查看` 均为 `list` 的别名（已合并）
   - `list` / `switch` 后跟数字 → `{"local_id": int}`（按本地 id 切换）
   - `list` / `switch` 后跟模式别名（识图/普通/图片/文本...）→ `{"mode": "vision"|"normal"}`
   - `switch` 无参或参数无效 → `{"local_id": None, "mode": None}`（调用方显示列表）
-- 其余情况 → send（`-v` 时 mode=vision，否则由调用方决定当前模式）
+- 其余情况 → send，payload 为 `{"text": str}`（当前会话提问）
 - 其余 token 原样拼接为提问文本
 
 ### 3.3 `core/session_core.py` — 统一会话核心（全异步，多会话 + 本地 id）
@@ -113,7 +115,7 @@ astrbot_plugin_aisearch/
 | `send_image_message(text, paths, thinking)` | 识图会话上传图片 + 发送提问，返回 `(是否新建, 回答文本)` |
 | `ensure_mode(mode)` | 确保当前会话为指定模式：复用该模式最近活跃会话或新建，返回 `(conv, 是否新建)` |
 | `switch_conversation(local_id)` | 按本地 id 切换；id 不存在报错，已销毁则同模式重建（id 保留），返回 `(conv, 是否重建)` |
-| `new_conversation(mode=None)` | 创建新会话（分配新 id）并设为当前；**不销毁旧会话** |
+| `new_conversation(mode=MODE_NORMAL)` | 创建新会话（分配新 id）并设为当前；**v2.2.10 起总是新建普通会话，不继承当前模式**；不销毁旧会话 |
 | `destroy_conversation(local_id)` | 销毁会话（空闲超时调用），返回是否真有会话被销毁 |
 | `conversation_summary(local_id)` / `list_summary()` | 单个 / 全部会话展示数据（按 id 升序） |
 | `close()` | 关闭浏览器（插件卸载 / 登录刷新） |
@@ -148,21 +150,20 @@ astrbot_plugin_aisearch/
 | `_build_keyboard()` / `_try_send_with_keyboard()` | QQ 官方平台键盘按钮消息（其余平台自动回退纯文本） |
 | `login_command()` | `/cloak登录`：后台线程扫码登录，成功后重置浏览器内核 |
 
-**命令列表（v2.1.0）**：
+**命令列表（v2.1.0，v2.2.10 更新）**：
 
 | 命令 | 说明 |
 |------|------|
 | `/ais <问题>` | 当前会话提问（无会话自动创建） |
-| `/ais -v <问题>` | 切到识图会话提问 |
-| `/ais new`（reset/重置） | 开启新会话（旧会话保留，可按 id 切回） |
-| `/ais list`（列表/状态/session） | 查看全部会话（带本地 id，👉 为当前） |
+| `/ais new`（reset/重置） | 开启新的**普通会话**（旧会话保留，可按 id 切回） |
+| `/ais list`（列表/状态/session） | 查看会话列表（带本地 id，👉 为当前；**已关闭的不显示**） |
 | `/ais switch <id>`（切换） | 按本地 id 切换会话（已关闭的自动重建） |
 | `/ais switch 识图/普通` | 按模式切换（复用该模式最近会话，无则新建） |
 | `/ais list <id>` | 列表便捷切换（等同于 /ais switch <id>） |
 | `/ais help`（帮助） | 帮助 |
 | `/cloak登录` | 微信扫码登录 |
 
-> `-t` 旗标自 v2.2.5 起保留解析但无实际效果（深度思考跟随 DeepSeek 网页端设置）。
+> `-t` / `-v` 旗标自 v2.2.5 / v2.2.10 起保留解析（兼容剥离）但无实际效果：深度思考跟随 DeepSeek 网页端设置；识图由发送图片自动触发（v2.2.9 起每次传图新建识图会话），无需 `-v`。
 
 **防刷屏与指令保护策略**：
 - 会话空闲超时**静默销毁**，不推送任何主动通知（此前每会话超时都会向聊天窗口推送一条）
@@ -218,13 +219,12 @@ astrbot_plugin_aisearch/
        │
        ▼
   ai_search_command() / on_auto_message()
-       │  send: mode = -v ? "vision" : None（保持当前会话）
+       │  send: 直接在当前会话提问（-t/-v 旗标 v2.2.10 起无效果）
        ▼
-  DeepSeekSessionCore.send_message(text, thinking, mode) → (created, result)
+  DeepSeekSessionCore.send_message(text) → (created, result)
        │
-       ├─ ensure_current_locked(mode)：
+       ├─ ensure_current_locked(None)：
        │    ├─ 当前会话匹配？ ──→ _goto_session(conv.url)
-       │    ├─ mode 指定？ ──→ 复用该模式最近活跃会话 / 新建
        │    └─ 无当前会话？ ──→ _create_conversation(normal) + _register(分配新 id)
        │                          ├─ _open_new_chat()（新对话页）
        │                          └─ vision？ _switch_to_vision()（点击识图模式）
@@ -379,6 +379,16 @@ astrbot_plugin_aisearch/
 |------|------|------|
 | 每次传图新建识图会话 | ✅ | `send_image_message` 强制 `_create_conversation(MODE_VISION)` + `_register`，不再复用旧识图会话，避免多图同会话导致回复异常 |
 
+### ✅ v2.2.10 已完成功能
+
+| 功能 | 状态 | 说明 |
+|------|------|------|
+| `-v` 旗标移除语义 | ✅ | 带图自动新建识图会话后 `/ais -v` 无意义；解析保留兼容剥离但无效果，键盘按钮「识图对话」与 usage/help 文案同步移除（`-t` 同 v2.2.5 无效果） |
+| `/ais new` 总是普通会话 | ✅ | `new_conversation` 缺省 `MODE_NORMAL`，不再继承上一轮会话模式（识图由发图触发，新建识图会话无意义） |
+| 列表紧凑化 | ✅ | `/ais list` 一行一个会话：`👉 1  普通对话 ｜ 3 条 ｜ 最后活跃 08-30 17:14`，去掉 # 号与多行提示 |
+| 列表过滤已销毁 | ✅ | 空闲超时关闭的会话不再显示在 `/ais list`（`_format_session_list` 过滤 `destroyed`），仍可按 id 切换时自动重建 |
+| 单元测试 | ✅ | 指令解析 35 用例 + 会话核心 mock 测试全部通过 |
+
 ### ⚠️ 已知问题 / 待改进
 
 - **UI 依赖**：识图模式入口、上传输入框等选择器基于 2026-06 上线的 DeepSeek 网页版 UI，改版后需更新 `session_core.py`
@@ -408,4 +418,4 @@ astrbot_plugin_aisearch/
 
 ---
 
-*文档更新日期：2026-08-30（v2.2.9）*
+*文档更新日期：2026-08-30（v2.2.10）*

@@ -14,11 +14,15 @@ CASES = [
     ("-v -t", "usage", {}),
 
     # 普通提问
-    ("你好", "send", {"mode": None, "thinking": False, "text": "你好"}),
-    ("今天有什么大新闻", "send", {"mode": None, "thinking": False, "text": "今天有什么大新闻"}),
-    ("-t 解释量子纠缠", "send", {"mode": None, "thinking": True, "text": "解释量子纠缠"}),
-    ("-v 这张图", "send", {"mode": "vision", "thinking": False, "text": "这张图"}),
-    ("-v -t 看图", "send", {"mode": "vision", "thinking": True, "text": "看图"}),
+    ("你好", "send", {"text": "你好"}),
+    ("今天有什么大新闻", "send", {"text": "今天有什么大新闻"}),
+    # -t / -v 兼容旗标：剥离但无效果（v2.2.5 / v2.2.10 起）
+    ("-t 解释量子纠缠", "send", {"text": "解释量子纠缠"}),
+    ("-v 这张图", "send", {"text": "这张图"}),
+    ("-v -t 看图", "send", {"text": "看图"}),
+    ("--vision 描述图片", "send", {"text": "描述图片"}),
+    # 未知旗标原样保留（当作普通问题的一部分）
+    ("-x 自定义", "send", {"text": "-x 自定义"}),
 
     # new 子命令（含别名）
     ("new", "new", {}),

@@ -2,15 +2,16 @@
 
 /ais 用法：
   /ais <问题>                     在当前会话提问（无会话则自动创建普通会话）
-  /ais -t <问题>                  开启深度思考
-  /ais -v <问题>                  切到识图会话并提问（无识图会话则自动创建）
-  /ais -v -t <问题>               识图会话 + 深度思考
-  /ais new | reset | 重置         开启新会话（旧会话保留，可按 id 切回）
+  /ais new | reset | 重置         开启新的普通会话（旧会话保留，可按 id 切回）
   /ais list | 列表 | 状态 | session   查看全部会话（带本地 id）
   /ais list <id>                  按本地 id 直接切换（便捷写法）
   /ais switch <id> | <识图/普通>   切换会话（按本地 id 或模式）
   /ais switch                     无参数 = 显示会话列表
   /ais help | 帮助                查看帮助
+
+兼容说明：`-t` / `-v` 旗标自 v2.2.5 / v2.2.10 起无实际效果
+（深度思考跟随 DeepSeek 网页端设置；识图由发送图片自动触发），
+解析时仍会剥离，避免把旗标文本当作问题发给 AI。
 """
 
 SUBCOMMAND_ALIASES = {
@@ -28,22 +29,15 @@ MODE_ALIASES = {
 }
 
 
-def _strip_flags(tokens):
-    """提取开头的 -t / -v 旗标，返回 (thinking, vision, 剩余tokens)"""
-    thinking = False
-    vision = False
+def _strip_compat_flags(tokens):
+    """剥离开头的 -t / -v 兼容旗标（无实际效果，仅避免旗标文本被当问题发送），
+    返回剩余 tokens。"""
     rest = []
     for tok in tokens:
-        if tok in ("-t", "--think", "思考"):
-            thinking = True
-        elif tok in ("-v", "--vision", "识图模式"):
-            vision = True
-        elif tok.startswith("-"):
-            # 未知旗标：直接拼回文本（当作普通问题的一部分）
-            rest.append(tok)
-        else:
-            rest.append(tok)
-    return thinking, vision, rest
+        if tok in ("-t", "--think", "思考", "-v", "--vision", "识图模式"):
+            continue
+        rest.append(tok)
+    return rest
 
 
 def _parse_switch_target(tokens):
@@ -67,7 +61,7 @@ def parse_ais_command(raw: str):
     返回 (action, payload)：
       action: "usage" | "help" | "send" | "new" | "list" | "switch"
       payload: dict
-        - send:    {"mode": "vision"|None, "thinking": bool, "text": str}
+        - send:    {"text": str}
         - switch:  {"local_id": int} | {"mode": str} | {}
         - 其余:    {}
     """
@@ -76,7 +70,7 @@ def parse_ais_command(raw: str):
         return "usage", {}
 
     tokens = q.split()
-    thinking, vision, rest_tokens = _strip_flags(tokens)
+    rest_tokens = _strip_compat_flags(tokens)
     rest = " ".join(rest_tokens).strip()
 
     # 无正文且只有旗标
@@ -103,6 +97,5 @@ def parse_ais_command(raw: str):
         # 兜底
         return action, {}
 
-    # 普通提问（含旗标）
-    mode = "vision" if vision else None
-    return "send", {"mode": mode, "thinking": thinking, "text": rest}
+    # 普通提问（-t/-v 旗标已剥离且无效果）
+    return "send", {"text": rest}

@@ -100,9 +100,10 @@ class CloakSearchPlugin(Star):
                 yield event.plain_result(f"❌ 切换会话失败: {e}")
             return
         if action == "new":
-            # /ais new — 开启新会话（旧会话保留在列表中，可按 id 切回）
+            # /ais new — 开启新的普通会话（v2.2.10 起不再继承上一轮模式；
+            # 旧会话保留在列表中，可按 id 切回）
             try:
-                conv = await self.session.new_conversation()
+                conv = await self.session.new_conversation(MODE_NORMAL)
                 self._arm_idle_timer(conv.local_id)
                 yield event.plain_result(
                     f"🔄 已开启新的{MODE_LABELS.get(conv.mode, conv.mode)}（会话 #{conv.local_id}）。\n"
@@ -114,12 +115,10 @@ class CloakSearchPlugin(Star):
                 yield event.plain_result(f"❌ 新建会话失败: {e}")
             return
 
-        # —— 提问（send）——
-        mode = payload.get("mode") or None  # "vision" 或 None（保持当前会话）
+        # —— 提问（send）——（-t/-v 旗标已无效果，直接在当前会话提问）
         text = payload["text"]
-        thinking = payload["thinking"]
         try:
-            created, result = await self.session.send_message(text, thinking, mode)
+            created, result = await self.session.send_message(text)
             result = await self._respond(event, created, result)
             if result:
                 yield event.plain_result(result)
@@ -226,7 +225,6 @@ class CloakSearchPlugin(Star):
             )
         kb = self._build_keyboard(
             ("💬 继续对话", "/ais "),
-            ("🖼 识图对话", "/ais -v "),
             ("🔀 切换会话", "/ais switch"),
         )
         if await self._try_send_with_keyboard(event, result, kb):
@@ -513,24 +511,30 @@ class CloakSearchPlugin(Star):
     # ═════════════════════ 展示文案 ═════════════════════
 
     def _format_session_list(self) -> str:
-        """格式化全部会话列表（带本地 id，供 /ais list / /ais switch 无参时使用）"""
-        items = self.session.list_summary()
+        """格式化会话列表（紧凑 markdown 表格风格，供 /ais list / /ais switch 无参时使用）。
+
+        v2.2.10 起：只显示未销毁（空闲超时已关闭）的会话——已销毁的会话
+        用户不会关心，仍可通过 /ais switch <id> 切换时自动重建。
+        """
+        items = [
+            it for it in self.session.list_summary()
+            if it["exists"] and not it["destroyed"]
+        ]
         if not items:
             return (
                 "📭 还没有任何会话。\n"
-                "直接发送 /ais 开始提问吧！"
+                "直接发送消息（或 @机器人）即可开始提问！"
             )
         lines = [f"📋 会话列表（共 {len(items)} 个，👉 为当前）:", ""]
         for it in items:
             marker = "👉" if it["is_current"] else "  "
-            status = "⏸ 已关闭" if it["destroyed"] else f"{it['message_count']} 条"
             lines.append(
-                f"{marker} #{it['local_id']}  {it['label']} ｜ {status} ｜ 最后活跃 {it['last_active']}"
+                f"{marker} {it['local_id']}  {it['label']} ｜ {it['message_count']} 条"
+                f" ｜ 最后活跃 {it['last_active']}"
             )
         lines += [
             "",
-            "💡 切换：/ais switch <id>（如 /ais switch 2），或 /ais list <id>",
-            "💡 新建：/ais new（旧会话保留，可随时切回）",
+            "💡 /ais switch <id> 切换会话 ｜ /ais new 新建",
         ]
         return "\n".join(lines)
 
@@ -539,8 +543,8 @@ class CloakSearchPlugin(Star):
         return (
             "⚠️ 用法：\n"
             "• 直接发送消息（@机器人 或私聊）即可自动联网提问，无需指令\n"
-            "• /ais <问题> — 在当前会话提问\n"
-            "• /ais -v <问题> — 切到识图会话提问\n\n"
+            "• @机器人 + 图片（或私聊发图）→ 自动进入识图模式\n"
+            "• /ais <问题> — 在当前会话提问\n\n"
             "📌 管理：/ais list（列表） ｜ /ais switch <id>（切换） ｜ "
             "/ais new（新建） ｜ /ais help（帮助）"
         )
@@ -556,9 +560,8 @@ class CloakSearchPlugin(Star):
             "• 仅切换/新建会话时才需要指令（/ais switch、/ais new）\n\n"
             "📋 统一指令 /ais（别名：搜索）：\n"
             "• /ais <问题> — 在当前会话联网提问（无会话自动创建）\n"
-            "• /ais -v <问题> — 切到「识图模式」会话提问（无则自动创建）\n"
-            "• /ais new（或 reset/重置）— 开启新会话，旧会话保留在列表中\n"
-            "• /ais list（或 列表/状态/session）— 查看全部会话（带本地 id，👉 为当前）\n"
+            "• /ais new（或 reset/重置）— 开启新的普通会话，旧会话保留在列表中\n"
+            "• /ais list（或 列表/状态/session）— 查看会话列表（👉 为当前，已关闭的不显示）\n"
             "• /ais switch <id>（或 切换）— 按本地 id 切换会话，如 /ais switch 2\n"
             "• /ais switch 识图/普通 — 切换到该模式最近使用的会话（无则新建）\n"
             "• /ais list <id> — 列表便捷切换（等同于 /ais switch <id>）\n"
@@ -570,7 +573,7 @@ class CloakSearchPlugin(Star):
             "📌 其他：\n"
             "• /cloak登录 — 微信扫码登录 DeepSeek\n"
             "• 示例：@机器人 今天有什么大新闻\n"
-            "  /ais -v 帮我看看这张图的配色\n"
+            "  @机器人 + 图片（自动识图）\n"
             "  /ais list\n"
             "  /ais switch 2"
         )

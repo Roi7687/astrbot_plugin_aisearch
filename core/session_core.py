@@ -183,12 +183,12 @@ class DeepSeekSessionCore:
             self._save_conversations()
             return conv, False
 
-    async def new_conversation(self, mode: str | None = None) -> Conversation:
-        """创建新会话并设为当前（mode 缺省沿用当前会话模式）。
+    async def new_conversation(self, mode: str = MODE_NORMAL) -> Conversation:
+        """创建新会话并设为当前（v2.2.10 起总是新建普通会话，
+        不再继承上一轮会话的模式——识图由发送图片自动触发，新建识图会话无意义）。
         旧会话保留在列表中，可按 id 切回。"""
         async with self.lock:
             self._check_closing()
-            mode = mode or self.current_mode
             conv = await self._create_conversation(mode)
             self._register(conv)
             return conv
