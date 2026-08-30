@@ -1,7 +1,7 @@
 # astrbot_plugin_aisearch 开发文档
 
 > **插件名称**：AI搜索  
-> **版本**：v2.2.8  
+> **版本**：v2.2.9  
 > **作者**：Roi  
 > **许可证**：AGPL-3.0  
 > **仓库地址**：https://github.com/Roi7687/astrbot_plugin_aisearch  
@@ -37,6 +37,8 @@
 **v2.2.7 变更**：**回归简单等待逻辑（修复卡死）**——基线计数 / 生成标志检测 / 补发重试等复杂逻辑在部分环境下导致「读入信息后卡死」或误判。`_send_query` 回归最早版本：发送后等待对话框最后一条回复出现（30 秒，兜底 `.ds-markdown`），随后对最后一条做**文本稳定检测**（连续 9 秒无变化视为完成），保留 300 秒总上限防无限等待；删除 `_is_generation_finished`。**识图上传双路确认（v2.2.1）完整保留**。
 
 **v2.2.8 变更**：**支持引用消息（Reply）中的图片**——QQ 引用（回复）一条含图片的消息时，图片位于 `Reply.chain`（被引用消息段列表）。`_collect_images` 增强：除当前消息图片外，同时收集所有 `Reply.chain` 中的 `Image` 组件（chain 为 None 时防御跳过），引用图片自动进入识图流程；`on_auto_message` 也会自动把「含引用图片的消息」让给识图处理。
+
+**v2.2.9 变更**：**每次传图新建识图会话**——多张图堆在同一个 DeepSeek 识图会话中易导致回复异常。`send_image_message` 改为每次上传都 `_create_conversation(MODE_VISION)` + `_register`（不可调用 `new_conversation()`，其内部持锁会死锁），不再复用旧识图会话；旧会话保留在列表中可按 id 切回，空闲超时自动销毁。
 
 ---
 
@@ -120,7 +122,7 @@ astrbot_plugin_aisearch/
 - **多会话 + 本地 id**：本地维护会话列表（普通/识图混合），`next_id` 本地递增计数（1、2、3...），持久化于 conversations.json；重启后 id 连续不重复
 - **串行化**：所有页面操作经 `asyncio.Lock` 互斥，避免并发命令竞态
 - **惰性创建**：首次使用时才启动浏览器 / 开启新对话
-- **模式复用**：`ensure_mode('vision')` 优先复用该模式最近活跃的未销毁会话，无则新建
+- **模式复用**：`ensure_mode('vision')` 优先复用该模式最近活跃的未销毁会话，无则新建；**但 `send_image_message` 例外（v2.2.9）：每次传图强制新建识图会话**（多图同会话易致回复异常）
 - **已销毁会话重建**：按 id 切换到 `destroyed=True` 的会话时，同模式重建并保留原 id
 - **识图模式切换**：新对话页点击「识图模式」入口（精确标签 → 模糊文本 → 展开「+ / 更多」菜单多策略查找，中/英文标签均支持），以欢迎语「使用识图模式开始对话」或激活态类名验证；查找失败时保存 vision_debug.png 截图留档
 - **图片上传**：Playwright `set_input_files` 注入 `input[type=file]` → 等 blob 缩略图出现 → **双路上传完成确认**（`_wait_upload_finished`：① 监听上传网络请求 POST/PUT 含 upload/file 全部响应；② DOM 上传中标志消失兜底），确认完成才发送提问，避免慢速网络下「文本已发送但图片未传完」
@@ -238,7 +240,7 @@ astrbot_plugin_aisearch/
   _arm_idle_timer(local_id) → 300s 无活动 → destroy（静默，不推送通知）
 ```
 
-### 识图（@机器人 + 图片，v2.2.8 起支持引用消息中的图片）
+### 识图（@机器人 + 图片，v2.2.8 起支持引用消息中的图片；v2.2.9 起每图一个新会话）
 
 ```
 群聊 @机器人 + 图片（或私聊图片；也可引用一条含图片的消息）
@@ -251,7 +253,7 @@ astrbot_plugin_aisearch/
   _prepare_image_paths()（convert_to_file_path / 下载 / PIL 压缩）
        ▼
   send_image_message(text, paths) → (created, result)
-       ├─ ensure_current_locked(vision)：复用最近识图会话或新建（分配新 id）
+       ├─ _create_conversation(MODE_VISION) + _register（每次传图强制新建识图会话）
        ├─ set_input_files 上传 → 等 blob 缩略图
        └─ 输入文字（无则默认提示词）→ 发送 → 等待答案
        ▼
@@ -371,6 +373,12 @@ astrbot_plugin_aisearch/
 | 引用消息图片识别 | ✅ | `_collect_images` 同时收集当前消息与 Reply.chain 中的图片（chain=None 防御），引用含图消息自动走识图 |
 | 自动触发联动 | ✅ | `on_auto_message` 检测到引用图片后自动让给识图处理 |
 
+### ✅ v2.2.9 已完成功能
+
+| 功能 | 状态 | 说明 |
+|------|------|------|
+| 每次传图新建识图会话 | ✅ | `send_image_message` 强制 `_create_conversation(MODE_VISION)` + `_register`，不再复用旧识图会话，避免多图同会话导致回复异常 |
+
 ### ⚠️ 已知问题 / 待改进
 
 - **UI 依赖**：识图模式入口、上传输入框等选择器基于 2026-06 上线的 DeepSeek 网页版 UI，改版后需更新 `session_core.py`
@@ -400,4 +408,4 @@ astrbot_plugin_aisearch/
 
 ---
 
-*文档更新日期：2026-08-30（v2.2.8）*
+*文档更新日期：2026-08-30（v2.2.9）*

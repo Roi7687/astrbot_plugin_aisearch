@@ -123,14 +123,21 @@ class DeepSeekSessionCore:
     async def send_image_message(
         self, text: str, image_paths: list, thinking: bool = False
     ) -> tuple[bool, str]:
-        """在识图会话中发送图片（可附带文字）。返回 (是否新建了会话, 回答文本)"""
+        """上传图片到**全新的识图会话**并发送提问。返回 (是否新建了会话, 回答文本)。
+
+        v2.2.9 起每次传图都新建识图会话：多张图堆在同一个 DeepSeek 识图会话
+        中容易导致回复异常；旧会话保留在列表中（/ais list 可见，/ais switch <id> 可切回）。
+        注意：此处不能调用 new_conversation()（其内部持锁，会与当前锁死锁），
+        直接 _create_conversation + _register。
+        """
         async with self.lock:
             self._check_closing()
-            conv, created = await self.ensure_current_locked(MODE_VISION)
+            conv = await self._create_conversation(MODE_VISION)
+            self._register(conv)
             await self._upload_images(image_paths)
             result = await self._send_query(text or DEFAULT_VISION_PROMPT, thinking)
             self._mark_active(conv)
-            return created, result
+            return True, result
 
     async def ensure_mode(self, mode: str) -> tuple[Conversation, bool]:
         """确保当前会话为指定模式：复用该模式最近活跃会话，没有则新建。
