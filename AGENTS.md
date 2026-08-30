@@ -1,7 +1,7 @@
 # astrbot_plugin_aisearch 开发文档
 
 > **插件名称**：AI搜索  
-> **版本**：v2.2.7  
+> **版本**：v2.2.8  
 > **作者**：Roi  
 > **许可证**：AGPL-3.0  
 > **仓库地址**：https://github.com/Roi7687/astrbot_plugin_aisearch  
@@ -35,6 +35,8 @@
 **v2.2.6 变更**：**修复「等待 AI 回答超时」**——慢速网络 + 深度思考 + 联网搜索下，DeepSeek 可能超过 60 秒才开始输出，原 60 秒「等待新回复块」超时过短；且若 Enter 发送失败（消息未发出）会干等超时。修复：① 等待新回复超时放宽至 **180 秒**；② 等待期间每 5 秒检查输入框是否清空，未清空则补点发送按钮，**连续 3 次仍失败提前报「消息发送失败」**；③ 超时前将页面文本片段写入日志留档，便于排查。
 
 **v2.2.7 变更**：**回归简单等待逻辑（修复卡死）**——基线计数 / 生成标志检测 / 补发重试等复杂逻辑在部分环境下导致「读入信息后卡死」或误判。`_send_query` 回归最早版本：发送后等待对话框最后一条回复出现（30 秒，兜底 `.ds-markdown`），随后对最后一条做**文本稳定检测**（连续 9 秒无变化视为完成），保留 300 秒总上限防无限等待；删除 `_is_generation_finished`。**识图上传双路确认（v2.2.1）完整保留**。
+
+**v2.2.8 变更**：**支持引用消息（Reply）中的图片**——QQ 引用（回复）一条含图片的消息时，图片位于 `Reply.chain`（被引用消息段列表）。`_collect_images` 增强：除当前消息图片外，同时收集所有 `Reply.chain` 中的 `Image` 组件（chain 为 None 时防御跳过），引用图片自动进入识图流程；`on_auto_message` 也会自动把「含引用图片的消息」让给识图处理。
 
 ---
 
@@ -139,7 +141,7 @@ astrbot_plugin_aisearch/
 | `_arm_idle_timer()` / `_idle_waiter()` | 每会话独立空闲计时器，超时**静默销毁**（不推送通知，避免刷屏） |
 | `_is_self_message()` | 跳过机器人自己发出的消息（部分平台会回传自身消息，防止自我回复循环） |
 | `_is_command_message()` | 跳过被 AstrBot 识别为指令的消息（waking_check 已剥离指令前缀，无法靠文本判断；检查 activated_handlers 中带 Command 类 filter 的 handler），防止自动触发拦截 /cloak登录、/ais 等指令 |
-| `_collect_images()` | 兼容新旧 AstrBot API 提取图片组件 |
+| `_collect_images()` | 兼容新旧 AstrBot API 提取图片组件；v2.2.8 起同时收集引用消息（Reply.chain）中的图片 |
 | `_prepare_image_paths()` | 图片 → 本地路径（自动下载、PIL 压缩） |
 | `_build_keyboard()` / `_try_send_with_keyboard()` | QQ 官方平台键盘按钮消息（其余平台自动回退纯文本） |
 | `login_command()` | `/cloak登录`：后台线程扫码登录，成功后重置浏览器内核 |
@@ -236,14 +238,14 @@ astrbot_plugin_aisearch/
   _arm_idle_timer(local_id) → 300s 无活动 → destroy（静默，不推送通知）
 ```
 
-### 识图（@机器人 + 图片）
+### 识图（@机器人 + 图片，v2.2.8 起支持引用消息中的图片）
 
 ```
-群聊 @机器人 + 图片（或私聊图片）
+群聊 @机器人 + 图片（或私聊图片；也可引用一条含图片的消息）
        │
        ▼
   on_image_message()（EventMessageType.ALL）
-       ├─ 无图片 / 未@ → 直接返回，不拦截
+       ├─ 无图片 / 未@ → 直接返回，不拦截（_collect_images 同时检查当前消息与 Reply.chain）
        ├─ 命中 → event.stop_event()（阻止默认 LLM 响应）
        ▼
   _prepare_image_paths()（convert_to_file_path / 下载 / PIL 压缩）
@@ -362,6 +364,13 @@ astrbot_plugin_aisearch/
 | 回归简单等待逻辑 | ✅ | `_send_query` 回归「等待最后一条回复出现 + 文本稳定检测（9s）」，删除基线计数 / 生成标志检测 / 补发重试，修复部分环境下卡死 |
 | 识图上传保留 | ✅ | v2.2.1 的上传双路确认（`_wait_upload_finished`）完整保留，确保图片上传完成后再发送 |
 
+### ✅ v2.2.8 已完成功能
+
+| 功能 | 状态 | 说明 |
+|------|------|------|
+| 引用消息图片识别 | ✅ | `_collect_images` 同时收集当前消息与 Reply.chain 中的图片（chain=None 防御），引用含图消息自动走识图 |
+| 自动触发联动 | ✅ | `on_auto_message` 检测到引用图片后自动让给识图处理 |
+
 ### ⚠️ 已知问题 / 待改进
 
 - **UI 依赖**：识图模式入口、上传输入框等选择器基于 2026-06 上线的 DeepSeek 网页版 UI，改版后需更新 `session_core.py`
@@ -391,4 +400,4 @@ astrbot_plugin_aisearch/
 
 ---
 
-*文档更新日期：2026-08-30（v2.2.7）*
+*文档更新日期：2026-08-30（v2.2.8）*

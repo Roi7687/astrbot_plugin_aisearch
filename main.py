@@ -7,7 +7,7 @@ import threading
 
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.event.filter import EventMessageType
-from astrbot.api.message_components import Image
+from astrbot.api.message_components import Image, Reply
 from astrbot.api.star import Context, Star
 from astrbot.core.star.filter.command import GreedyStr
 
@@ -292,7 +292,12 @@ class CloakSearchPlugin(Star):
     # ═════════════════════ 图片工具 ═════════════════════
 
     async def _collect_images(self, event: AstrMessageEvent) -> list:
-        """兼容新旧 AstrBot API 获取消息中的图片组件"""
+        """兼容新旧 AstrBot API 获取消息中的图片组件。
+
+        同时收集**引用消息**（Reply）中被引用消息里的图片：
+        QQ 中引用（回复）一条含图片的消息时，图片位于 Reply.chain 中，
+        需一并提取才能走识图流程。
+        """
         images = []
         get_image = getattr(event, "get_image", None)
         if callable(get_image):
@@ -306,6 +311,15 @@ class CloakSearchPlugin(Star):
                 images = []
         if not images:
             images = [c for c in event.get_messages() if isinstance(c, Image)]
+        # 引用消息中的图片（被引用的消息可能含图，chain 可能为 None 需防御）
+        try:
+            for c in event.get_messages():
+                if isinstance(c, Reply) and getattr(c, "chain", None):
+                    for rc in c.chain:
+                        if isinstance(rc, Image):
+                            images.append(rc)
+        except Exception:
+            pass
         return images
 
     async def _prepare_image_paths(self, images: list) -> list:
