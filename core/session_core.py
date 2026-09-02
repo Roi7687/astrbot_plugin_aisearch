@@ -183,20 +183,28 @@ class DeepSeekSessionCore:
             return conv
 
     async def destroy_conversation(self, local_id: int) -> bool:
-        """销毁指定会话（空闲超时调用）：服务器端删除 + 本地记录一并移除。
+        """销毁空闲超时的会话（由空闲计时器调用）：服务器端删除 + 本地记录一并移除。
 
         v2.2.11 起不再保留已销毁的记录（用户无法再访问，且避免
         conversations.json 无限膨胀）；销毁的是当前会话时重置 current_id。
+        v2.2.12 起**锁内权威校验真实空闲时间**：若计时器到点后会话仍有新活动
+        （例如一次提问耗时跨越了计时终点，等待锁期间刚完成提问），放弃销毁；
+        全部会话销毁后 id 计数归 1，避免无限增长。
         返回是否真的有会话被销毁。
         """
         async with self.lock:
             conv = self.conversations.get(local_id)
             if not conv or conv.destroyed:
                 return False
+            # 真实空闲校验（会话记录仍在且最近 300s 内有活动 → 不销毁）
+            if time.time() - conv.last_active < IDLE_TIMEOUT_SECONDS:
+                return False
             await self._delete_session_best_effort(conv)
             del self.conversations[local_id]
             if self.current_id == local_id:
                 self.current_id = None
+            if not self.conversations:
+                self.next_id = 1  # v2.2.12：无存活会话时 id 计数归 1
             self._save_conversations()
             logger.info(
                 f"⏳ [Session] 会话 #{local_id}（{MODE_LABELS.get(conv.mode, conv.mode)}）已销毁并移除记录。"
@@ -262,6 +270,9 @@ class DeepSeekSessionCore:
 
     def _register(self, conv: Conversation):
         """为新会话分配本地 id 并登记为当前会话"""
+        if not self.conversations:
+            # v2.2.12：没有任何存活会话时 id 从 1 重新开始，避免无限增长
+            self.next_id = 1
         conv.local_id = self.next_id
         self.next_id += 1
         self.conversations[conv.local_id] = conv
@@ -310,11 +321,18 @@ class DeepSeekSessionCore:
             stale = [i for i, c in self.conversations.items() if c.destroyed]
             for i in stale:
                 del self.conversations[i]
+            changed = bool(stale)
+            if stale:
+                logger.info(f"🧹 [Session] 已清理 {len(stale)} 条已销毁的会话记录。")
+            # v2.2.12：无任何存活会话时 id 计数归 1（避免无限增长）
+            if not self.conversations and self.next_id != 1:
+                self.next_id = 1
+                changed = True
+                logger.info("🧹 [Session] 无存活会话，id 计数已归 1。")
             if self.current_id not in self.conversations:
                 self.current_id = None
-            if stale:
+            if changed:
                 self._save_conversations()
-                logger.info(f"🧹 [Session] 已清理 {len(stale)} 条已销毁的会话记录。")
             logger.info(
                 f"📂 [Session] 已加载会话元数据: {len(self.conversations)} 个会话（下一个 id={self.next_id}）"
             )
@@ -359,13 +377,15 @@ class DeepSeekSessionCore:
         """（持锁调用）确保当前会话就绪：返回 (会话, 是否新建)"""
         conv = self.current_conversation
         if conv and not conv.destroyed and (mode is None or conv.mode == mode):
-            # 当前会话模式匹配（或无需指定）：导航回其页面，失效则重建
+            # 当前会话模式匹配（或无需指定）：导航回其页面，失效则移除记录并新建
             try:
                 await self._goto_session(conv)
                 return conv, False
             except ConversationError:
-                logger.warning(f"⚠️ [Session] 会话 #{conv.local_id} 页面已失效，自动重建...")
-                conv.destroyed = True
+                logger.warning(f"⚠️ [Session] 会话 #{conv.local_id} 页面已失效，移除记录并新建...")
+                del self.conversations[conv.local_id]
+                if self.current_id == conv.local_id:
+                    self.current_id = None
                 self._save_conversations()
         if mode is not None:
             # 指定模式：复用该模式最近活跃会话
@@ -377,8 +397,10 @@ class DeepSeekSessionCore:
                     self._save_conversations()
                     return cand, False
                 except ConversationError:
-                    logger.warning(f"⚠️ [Session] 会话 #{cand.local_id} 页面已失效，自动重建...")
-                    cand.destroyed = True
+                    logger.warning(f"⚠️ [Session] 会话 #{cand.local_id} 页面已失效，移除记录并新建...")
+                    del self.conversations[cand.local_id]
+                    if self.current_id == cand.local_id:
+                        self.current_id = None
                     self._save_conversations()
             conv = await self._create_conversation(mode)
             self._register(conv)

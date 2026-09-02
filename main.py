@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import threading
+import time
 
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.event.filter import EventMessageType
@@ -234,21 +235,32 @@ class CloakSearchPlugin(Star):
     # ═════════════════════ 空闲超时（静默销毁） ═════════════════════
 
     def _arm_idle_timer(self, local_id: int):
-        """重置指定会话的空闲计时器"""
+        """重置指定会话的空闲计时器（每次提问/切换/新建后调用）"""
         task = self._timer_tasks.get(local_id)
         if task and not task.done():
             task.cancel()
         self._timer_tasks[local_id] = asyncio.ensure_future(self._idle_waiter(local_id))
 
     async def _idle_waiter(self, local_id: int):
-        """空闲超时后静默销毁会话（不再主动推送通知，避免刷屏）"""
+        """空闲超时后静默销毁会话（不再主动推送通知，避免刷屏）。
+
+        v2.2.12 起计时以**真实空闲时间**（last_active）为准：
+        计时器到点后二次校验，若 sleep 期间会话仍有活动（例如一次提问耗时
+        跨越了计时终点、提问刚结束），则按最后活跃时间重新计时而非销毁；
+        destroy_conversation 内部还有锁内权威校验兜底，杜绝「对话中被销毁」。
+        """
         try:
             await asyncio.sleep(IDLE_TIMEOUT_SECONDS)
             conv = self.session.get_conversation(local_id)
-            if conv and not conv.destroyed:
-                label = MODE_LABELS.get(conv.mode, conv.mode)
-                logger.info(f"⏳ [AIS] 会话 #{local_id}（{label}）空闲超时，静默销毁。")
-                await self.session.destroy_conversation(local_id)
+            if not conv or conv.destroyed:
+                return  # 会话已不存在（被销毁或记录被移除）
+            if time.time() - conv.last_active < IDLE_TIMEOUT_SECONDS - 1:
+                # sleep 期间有新活动：重新计时，不销毁
+                self._arm_idle_timer(local_id)
+                return
+            label = MODE_LABELS.get(conv.mode, conv.mode)
+            logger.info(f"⏳ [AIS] 会话 #{local_id}（{label}）空闲超时，静默销毁。")
+            await self.session.destroy_conversation(local_id)
         except asyncio.CancelledError:
             pass
 

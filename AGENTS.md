@@ -1,7 +1,7 @@
 # astrbot_plugin_aisearch 开发文档
 
 > **插件名称**：AI搜索  
-> **版本**：v2.2.11  
+> **版本**：v2.2.12  
 > **作者**：Roi  
 > **许可证**：AGPL-3.0  
 > **仓库地址**：https://github.com/Roi7687/astrbot_plugin_aisearch  
@@ -43,6 +43,8 @@
 **v2.2.10 变更**：**指令/列表体验清理**——① **`-v` 旗标移除语义**：带图消息（@机器人 + 图片 / 私聊发图）已自动新建识图会话，`/ais -v` 不再切换到识图模式；解析仍剥离 `-v`（避免旗标文本被当问题发送）但无效果，键盘按钮「🖼 识图对话」与 usage/help 文案同步移除；② **`/ais new` 总是新建普通会话**：不再继承上一轮会话的模式（上一轮为识图时新建识图会话没有意义）；③ **`/ais list` 改为紧凑 markdown 表格风格**：一行一个会话（`👉 1  普通对话 ｜ 3 条 ｜ 最后活跃 08-30 17:14`），去掉 # 号与多行提示；④ **已销毁（空闲超时关闭）的会话不再显示在列表中**——用户不会关心，仍可通过 `/ais switch <id>` 切换时自动重建。
 
 **v2.2.11 变更**：**冗余逻辑清理**——① **`-t` 旗标彻底不再识别**（v2.2.5 起已无效果，`-t` 按普通文本处理）；② **删除 `thinking` 参数链**：`send_message` / `send_image_message` / `_send_query` 的 `thinking` 参数已无任何作用（深度思考跟随 DeepSeek 网页端设置），彻底移除；③ **删除 `on_auto_message` 的 `text.startswith("/")` 死代码**（waking_check 已剥离指令前缀，该检查永不命中，`_is_command_message` 已完整覆盖）；④ **`MODE_ALIASES` 移除 `"v"` / `"n"` 单字母别名**（`-v` 时代残留）；⑤ **`/ais list <id>` 便捷切换移除**（与 `/ais switch <id>` 重复，切换统一走 switch）；⑥ **销毁即删除记录**：会话空闲销毁时从 conversations.json 中一并移除该记录（用户无法再访问已销毁会话，且避免文件无限膨胀），加载时自动清理历史 destroyed 数据并立即落盘；销毁当前会话时重置 current_id；`switch_conversation` 删除「已销毁重建」分支（id 不存在直接报错）。
+
+**v2.2.12 变更**：**修复 id 无限增长与空闲销毁误杀**——① **id 计数归 1**：`_register` 分配 id 前、`destroy_conversation` 全部销毁后、`_load_conversations` 加载空文件时，只要**没有任何存活会话**就把 `next_id` 归 1（新会话从 #1 重新开始）；② **页面失效不再残留 destroyed 记录**：`ensure_current_locked` 两处「页面已失效自动重建」路径由「标记 destroyed=True 保留」改为「删除记录后新建」，与 v2.2.11 语义一致；③ **空闲销毁以真实空闲时间为准**：`_idle_waiter` 计时器到点后二次校验 `last_active`——若 sleep 期间会话仍有活动（如一次提问耗时跨越计时终点），按最后活跃重新计时而非销毁；`destroy_conversation` 增加**锁内权威校验**（等待锁期间有新活动则放弃销毁），杜绝「对话中被销毁」。每次提问/切换/新建后 `_arm_idle_timer` 都会重置该会话计时器。
 
 ---
 
@@ -118,16 +120,16 @@ astrbot_plugin_aisearch/
 | `ensure_mode(mode)` | 确保当前会话为指定模式：复用该模式最近活跃会话或新建，返回 `(conv, 是否新建)` |
 | `switch_conversation(local_id)` | 按本地 id 切换；id 不存在（含已销毁被移除）报错，返回 `(conv, 是否重建)` |
 | `new_conversation(mode=MODE_NORMAL)` | 创建新会话（分配新 id）并设为当前；**v2.2.10 起总是新建普通会话，不继承当前模式**；不销毁旧会话 |
-| `destroy_conversation(local_id)` | 销毁会话（空闲超时调用）：服务器端删除 + **本地记录一并移除**（v2.2.11），返回是否真的有会话被销毁 |
+| `destroy_conversation(local_id)` | 销毁空闲超时的会话：服务器端删除 + 记录移除（v2.2.11）；**锁内校验真实空闲**、全部销毁后 id 归 1（v2.2.12），返回是否真的有会话被销毁 |
 | `conversation_summary(local_id)` / `list_summary()` | 单个 / 全部会话展示数据（按 id 升序） |
 | `close()` | 关闭浏览器（插件卸载 / 登录刷新） |
 
 **设计要点**：
-- **多会话 + 本地 id**：本地维护会话列表（普通/识图混合），`next_id` 本地递增计数（1、2、3...），持久化于 conversations.json；重启后 id 连续不重复
+- **多会话 + 本地 id**：本地维护会话列表（普通/识图混合），`next_id` 本地递增计数（1、2、3...），持久化于 conversations.json；重启后 id 连续不重复；**v2.2.12 起没有任何存活会话时 id 归 1**（`_register` 分配前 / 全部销毁后 / 加载空文件时），新会话从 #1 重新开始
 - **串行化**：所有页面操作经 `asyncio.Lock` 互斥，避免并发命令竞态
 - **惰性创建**：首次使用时才启动浏览器 / 开启新对话
 - **模式复用**：`ensure_mode('vision')` 优先复用该模式最近活跃的未销毁会话，无则新建；**但 `send_image_message` 例外（v2.2.9）：每次传图强制新建识图会话**（多图同会话易致回复异常）
-- **销毁即删除记录（v2.2.11）**：空闲销毁时从 conversations.json 移除该记录（用户无法再访问已销毁会话）；销毁当前会话时重置 current_id；加载时自动清理历史 destroyed 数据并立即落盘；`Conversation.destroyed` 字段仅作历史兼容（页面失效重建路径短暂使用）
+- **销毁即删除记录（v2.2.11，v2.2.12 强化）**：空闲销毁时从 conversations.json 移除该记录（用户无法再访问已销毁会话）；销毁当前会话时重置 current_id；**锁内权威校验真实空闲**——等待锁期间会话有新活动则放弃销毁（v2.2.12，杜绝「对话中被销毁」）；页面失效路径同样删除记录而非标记 destroyed（v2.2.12）；加载时自动清理历史 destroyed 数据并立即落盘；`Conversation.destroyed` 字段仅作历史兼容
 - **识图模式切换**：新对话页点击「识图模式」入口（精确标签 → 模糊文本 → 展开「+ / 更多」菜单多策略查找，中/英文标签均支持），以欢迎语「使用识图模式开始对话」或激活态类名验证；查找失败时保存 vision_debug.png 截图留档
 - **图片上传**：Playwright `set_input_files` 注入 `input[type=file]` → 等 blob 缩略图出现 → **双路上传完成确认**（`_wait_upload_finished`：① 监听上传网络请求 POST/PUT 含 upload/file 全部响应；② DOM 上传中标志消失兜底），确认完成才发送提问，避免慢速网络下「文本已发送但图片未传完」
 - **深度思考/联网搜索**：v2.2.5 起**不自动操作开关**（UI 无法稳定定位，检查徒增噪音），跟随 DeepSeek 网页端设置（默认开启）；`-t` 旗标 v2.2.11 起彻底不识别
@@ -144,7 +146,7 @@ astrbot_plugin_aisearch/
 | `on_image_message()` | `@filter.event_message_type(ALL)` 图片消息处理：@机器人 + 图片（或私聊图片）→ 识图会话 |
 | `on_auto_message()` | `@filter.event_message_type(ALL)` 自动触发：@机器人/私聊文本（非指令、非图片）→ 直接 AI 搜索对话，无需 /ais |
 | `_respond()` | 统一回复：刷新空闲计时 + 「已开启新会话」前缀 + 键盘按钮；返回空串表示已发送 |
-| `_arm_idle_timer()` / `_idle_waiter()` | 每会话独立空闲计时器，超时**静默销毁**（不推送通知，避免刷屏） |
+| `_arm_idle_timer()` / `_idle_waiter()` | 每会话独立空闲计时器：每次提问/切换/新建后重置；到点后**按真实空闲时间（last_active）二次校验**，有新活动则重新计时，超时**静默销毁**（不推送通知，避免刷屏） |
 | `_is_self_message()` | 跳过机器人自己发出的消息（部分平台会回传自身消息，防止自我回复循环） |
 | `_is_command_message()` | 跳过被 AstrBot 识别为指令的消息（waking_check 已剥离指令前缀，无法靠文本判断；检查 activated_handlers 中带 Command 类 filter 的 handler），防止自动触发拦截 /cloak登录、/ais 等指令 |
 | `_collect_images()` | 兼容新旧 AstrBot API 提取图片组件；v2.2.8 起同时收集引用消息（Reply.chain）中的图片 |
@@ -402,6 +404,15 @@ astrbot_plugin_aisearch/
 | 销毁即删除记录 | ✅ | 空闲销毁时从 conversations.json 移除记录（含 `current_id` 重置）；加载时自动清理历史 destroyed 数据并立即落盘；`switch_conversation` 不再有「已销毁重建」分支 |
 | 单元测试 | ✅ | 指令解析 35 用例 + 会话核心 mock 测试（含销毁删除/旧格式清理用例）全部通过 |
 
+### ✅ v2.2.12 已完成功能
+
+| 功能 | 状态 | 说明 |
+|------|------|------|
+| id 计数归 1 | ✅ | 没有任何存活会话时 `next_id` 归 1（`_register` 分配前 / `destroy_conversation` 全部销毁后 / `_load_conversations` 加载空文件时），新会话从 #1 重新开始，不再无限增长 |
+| 页面失效不留残留 | ✅ | `ensure_current_locked` 页面失效路径改为删除记录后新建（不再标记 destroyed=True 留残留记录） |
+| 空闲销毁防误杀 | ✅ | `_idle_waiter` 到点后按 `last_active` 二次校验（有新活动则重新计时）；`destroy_conversation` 锁内权威校验真实空闲，杜绝「对话中被销毁」 |
+| 单元测试 | ✅ | 指令解析 35 用例 + 会话核心 mock 测试（新增全部销毁归 1 / 空文件加载归 1 用例）全部通过 |
+
 ### ⚠️ 已知问题 / 待改进
 
 - **UI 依赖**：识图模式入口、上传输入框等选择器基于 2026-06 上线的 DeepSeek 网页版 UI，改版后需更新 `session_core.py`
@@ -431,4 +442,4 @@ astrbot_plugin_aisearch/
 
 ---
 
-*文档更新日期：2026-08-30（v2.2.11）*
+*文档更新日期：2026-08-30（v2.2.12）*

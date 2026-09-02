@@ -91,6 +91,23 @@ async def main():
     assert core._extract_session_id("https://chat.deepseek.com/s/dead-beef-1234") == "dead-beef-1234"
     assert core._extract_session_id("https://chat.deepseek.com/") == ""
 
+    # 8b. 全部会话销毁后 id 计数归 1（v2.2.12），新会话从 #1 重新开始
+    core.next_id = 99  # 模拟长时间累积后的计数
+    ok = await core.destroy_conversation(2)
+    assert ok is True
+    assert core.conversations == {}
+    assert core.next_id == 1, "next_id resets when all destroyed"
+    conv_r = Conversation(mode=MODE_NORMAL, created_at=1.0, last_active=1.0)
+    core._register(conv_r)
+    assert conv_r.local_id == 1 and core.next_id == 2, "new session restarts at 1"
+    assert core.current_id == 1
+
+    # 8c. 空会话文件（历史清理后 next_id 残留大值）加载时归 1（v2.2.12）
+    write_conv_file({"next_id": 99, "current_id": None, "conversations": {}})
+    core_empty = DeepSeekSessionCore()
+    assert core_empty.conversations == {}
+    assert core_empty.next_id == 1, "empty file resets next_id"
+
     # 9. _mark_active 发送后回写会话 URL / ID，并更新 current
     import types as _t
     core.page = _t.SimpleNamespace(url="https://chat.deepseek.com/a/chat/s/abc-123-456")
