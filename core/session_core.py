@@ -82,6 +82,7 @@ class DeepSeekSessionCore:
         self.context = None
         self.page = None
         self.bearer_token = None
+        self._toggle_warned: set = set()   # 已警告过的模式开关名（避免日志刷屏）
         self.lock = asyncio.Lock()      # 串行化所有页面操作
         self.conversations: dict[int, Conversation] = {}  # local_id -> 会话
         self.next_id = 1                # 本地会话 id 计数器
@@ -666,6 +667,8 @@ class DeepSeekSessionCore:
         兼容 cloakbrowser humanize：其 isolated-world resolver 不支持
         .filter(has_text=...) 链式 locator，改用纯 CSS 定位 + all_inner_texts
         过滤 + 尾部 .nth()。找不到返回 None。
+        visible_timeout 单位为**秒**（内部换算毫秒传给 playwright——修复
+        v2.2.4 起把 2.0 秒误当 2ms 导致等待必然超时的潜伏 bug）。
         """
         for selector in selectors:
             loc = self.page.locator(selector)
@@ -678,11 +681,44 @@ class DeepSeekSessionCore:
                 continue
             btn = loc.nth(idx)
             try:
-                await btn.wait_for(state="visible", timeout=visible_timeout)
+                await btn.wait_for(state="visible", timeout=int(visible_timeout * 1000))
             except Exception:
                 continue
             return btn
         return None
+
+    async def _ensure_deep_think_on(self) -> bool:
+        """确保「深度思考」模式开启（幂等）。v2.2.13 起普通/识图会话每次提问默认开启。
+
+        定位方式与 v1.3.0 相同：文本为「深度思考」的 .ds-toggle-button。
+        2026-08 真实登录态浏览器实测：该元素在当前 UI 仍存在且可点击——点击后
+        class 追加 ds-toggle-button--selected、aria-pressed 变 true；**再次点击会
+        关闭**，因此必须先检测激活态（已激活则不点击，避免开关被误关）。
+        找不到开关时降级不阻塞提问（网页端若已记忆开启则不受影响），仅首次警告。
+        """
+        btn = await self._locate_by_text((".ds-toggle-button",), "深度思考")
+        if btn is None:
+            if "深度思考" not in self._toggle_warned:
+                self._toggle_warned.add("深度思考")
+                logger.warning("⚠️ [Session] 未找到「深度思考」开关，保持网页端当前设置。")
+            return False
+        try:
+            active = await btn.evaluate(
+                """(el) => {
+                    const c = '' + (el.className || '');
+                    const aria = el.getAttribute('aria-pressed') || el.getAttribute('aria-checked');
+                    return c.indexOf('selected') >= 0 || c.indexOf('active') >= 0 || aria === 'true';
+                }"""
+            )
+            if active:
+                return True
+            await btn.click()
+            await asyncio.sleep(1.0)
+            logger.info("🔛 [Session] 已开启「深度思考」")
+            return True
+        except Exception as e:
+            logger.debug(f"[Session] 开启「深度思考」失败: {e}")
+            return False
 
     async def _type_and_send(self, text: str):
         """在输入框中输入文本并发送（Enter 优先，按钮兜底）"""
@@ -728,8 +764,10 @@ class DeepSeekSessionCore:
         随后对其做**文本稳定检测**（连续 9 秒无变化视为输出完成）。
         不做回复块计数 / 生成标志 / 补发重试等复杂判断，避免在部分环境下
         卡死或误判；保留 300 秒总上限防止异常情况下无限等待。
-        深度思考 / 联网搜索跟随 DeepSeek 网页端设置（不自动操作开关）。
+        v2.2.13 起每次提问前默认开启「深度思考」（幂等，无需任何参数）。
         """
+        # 默认启动深度思考（普通/识图会话一致；已开启时幂等跳过）
+        await self._ensure_deep_think_on()
         await self._type_and_send(text)
 
         # 发送后的快速错误检测
