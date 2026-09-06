@@ -1,7 +1,7 @@
 # astrbot_plugin_aisearch 开发文档
 
 > **插件名称**：AI搜索  
-> **版本**：v2.2.13  
+> **版本**：v2.2.14  
 > **作者**：Roi  
 > **许可证**：AGPL-3.0  
 > **仓库地址**：https://github.com/Roi7687/astrbot_plugin_aisearch  
@@ -47,6 +47,8 @@
 **v2.2.12 变更**：**修复 id 无限增长与空闲销毁误杀**——① **id 计数归 1**：`_register` 分配 id 前、`destroy_conversation` 全部销毁后、`_load_conversations` 加载空文件时，只要**没有任何存活会话**就把 `next_id` 归 1（新会话从 #1 重新开始）；② **页面失效不再残留 destroyed 记录**：`ensure_current_locked` 两处「页面已失效自动重建」路径由「标记 destroyed=True 保留」改为「删除记录后新建」，与 v2.2.11 语义一致；③ **空闲销毁以真实空闲时间为准**：`_idle_waiter` 计时器到点后二次校验 `last_active`——若 sleep 期间会话仍有活动（如一次提问耗时跨越计时终点），按最后活跃重新计时而非销毁；`destroy_conversation` 增加**锁内权威校验**（等待锁期间有新活动则放弃销毁），杜绝「对话中被销毁」。每次提问/切换/新建后 `_arm_idle_timer` 都会重置该会话计时器。
 
 **v2.2.13 变更**：**恢复默认启动深度思考**——用户反馈普通/识图回答不理想（未启用思考）。核对 v1.3.0：其通过文本为「深度思考」的 `.ds-toggle-button` 点击开启；**2026-08 真实登录态浏览器实测**该元素在当前 UI 仍存在且可点击：点击后 class 追加 `ds-toggle-button--selected`、`aria-pressed` 变 true，再点会关闭（必须幂等）。新增 `_ensure_deep_think_on()`：每次提问前（`_send_query`，普通/识图共用）用 `_locate_by_text` 定位 → 检测激活态（selected/active class 或 aria=true）→ 未激活才点击 → 找不到仅首次警告后降级。**顺带修复 v2.2.4 引入的潜伏 bug**：`_locate_by_text` 把 `visible_timeout`（秒）直接当 playwright `wait_for` 的 timeout（毫秒）传入，2.0 秒被当成 2ms 导致等待必然超时（发送按钮兜底因 Enter 常成功而未暴露），改为 `int(visible_timeout * 1000)`。无任何参数/配置项——深度思考默认全开。
+
+**v2.2.14 变更**：**修复深度思考下连续对话返回上一轮回复**——根因：发送后对「对话框最后一条回复」做 9 秒稳定检测，而深度思考/联网搜索下 AI 数十秒后才开始输出，旧回复一直是「最后一条」，稳定检测直接通过 → 返回旧回复。修复：**发送前**采样助手回复块基线（块数量 + 最后一块文本，仅在 assistant 专用选择器 `div.ds-markdown.ds-assistant-message-main-content` 上采样——通用 `.ds-markdown` 会匹配用户消息，实测会把用户消息当基线导致永远等不到变化），发送后轮询等待「回复块数量增加 或 最后一块文本变化」= 本轮新回复开始渲染（180s 上限），随后对最新回复做 9s 文本稳定检测。**真实浏览器双问验证**：快答（1+1，<2s 渲染）与慢答（相对论，深度思考数十秒）均正确拿到本轮新回复、不会返回上一轮内容。
 
 ---
 
@@ -135,7 +137,7 @@ astrbot_plugin_aisearch/
 - **识图模式切换**：新对话页点击「识图模式」入口（精确标签 → 模糊文本 → 展开「+ / 更多」菜单多策略查找，中/英文标签均支持），以欢迎语「使用识图模式开始对话」或激活态类名验证；查找失败时保存 vision_debug.png 截图留档
 - **图片上传**：Playwright `set_input_files` 注入 `input[type=file]` → 等 blob 缩略图出现 → **双路上传完成确认**（`_wait_upload_finished`：① 监听上传网络请求 POST/PUT 含 upload/file 全部响应；② DOM 上传中标志消失兜底），确认完成才发送提问，避免慢速网络下「文本已发送但图片未传完」
 - **深度思考（v2.2.13 起默认开启）**：每次提问前 `_ensure_deep_think_on()` **幂等**确保开启——`_locate_by_text` 定位文本为「深度思考」的 `.ds-toggle-button`，检测激活态（class 含 selected/active 或 aria-pressed/aria-checked=true），未激活才点击（2026-08 真实浏览器实测该元素有效；再次点击会关闭，故必须幂等）；找不到仅首次警告后降级不阻塞。无需任何参数/配置。联网搜索不自动操作（跟随 DeepSeek 网页端设置，默认开）
-- **答案等待**（v2.2.7 回归简单版）：发送后等待对话框最后一条回复出现（30 秒，兜底 `.ds-markdown`），随后对最后一条做**文本稳定检测**（连续 9 秒无变化视为完成，总上限 300 秒防无限等待）；不做回复块计数 / 生成标志 / 补发重试等复杂判断，避免部分环境下卡死；保留引用角标清理与 HTML→Markdown 转换
+- **答案等待**（v2.2.14 基线方案）：**发送前**在 assistant 专用选择器（`div.ds-markdown.ds-assistant-message-main-content`，不匹配用户消息）采样回复块基线（数量 + 最后一块文本），发送后轮询等待「回复块数量增加 或 最后一块文本变化」= 本轮新回复开始渲染（180s 上限），随后做**文本稳定检测**（连续 9 秒无变化视为输出完成，总上限 300s）——修复深度思考/联网搜索下 AI 延迟输出时把上一轮回复当成本轮结果的问题；不做回复块计数/生成标志/补发重试等复杂判断，避免部分环境下卡死；保留引用角标清理与 HTML→Markdown 转换
 - **会话删除**：`POST /api/v0/chat_session/delete`（Bearer 令牌嗅探），新旧 URL 格式（`/a/chat/s/<uuid>` 与 `/s/<id>`）均兼容
 - **元数据持久化**：每次变更写入 conversations.json（`{"next_id", "current_id", "conversations"}` 新格式；旧版 `{mode: {...}}` 双槽位格式自动迁移为 id 1=normal、2=vision）
 
@@ -234,8 +236,8 @@ astrbot_plugin_aisearch/
        │                          ├─ _open_new_chat()（新对话页）
        │                          └─ vision？ _switch_to_vision()（点击识图模式）
        │
-       ├─ _send_query()：确保「深度思考」开启（幂等，v2.2.13）→ 输入 + Enter/按钮发送
-       ├─ 等待最后一条回复出现 → 文本稳定检测（9s 无变化）→ HTML → Markdown
+       ├─ _send_query()：确保「深度思考」开启（幂等，v2.2.13）→ 输入发送
+       ├─ 发送前基线 → 等新回复块出现/文本变化（v2.2.14）→ 稳定 9s → HTML → Markdown
        └─ _mark_active(conv)（消息数+1，刷新空闲计时，回写真实 URL/id）
        │
        ▼
@@ -423,6 +425,14 @@ astrbot_plugin_aisearch/
 | `_locate_by_text` 潜伏 bug 修复 | ✅ | `wait_for(timeout)` 单位毫秒：`visible_timeout`（秒）改乘 1000，修复 v2.2.4 起 2.0s 被当 2ms 导致等待必然超时的问题（连带修复发送按钮兜底） |
 | 单元测试 | ✅ | 指令解析 35 用例 + 会话核心 mock 测试全部通过；真实浏览器闭环验证 ensure→激活、幂等不误关 |
 
+### ✅ v2.2.14 已完成功能
+
+| 功能 | 状态 | 说明 |
+|------|------|------|
+| 修复连续对话返回旧回复 | ✅ | 发送前在 assistant 专用选择器采样基线（块数量 + 最后文本），发送后轮询等「块数增加/文本变化」（180s）再进入 9s 稳定检测；修复深度思考延迟输出时把上一轮回复当成本轮结果 |
+| 快答/慢答双场景验证 | ✅ | 真实浏览器：1+1 快答（<2s 渲染）与相对论慢答（深度思考数十秒）连续两问均返回各自新回复，不会错拿上一轮内容 |
+| 单元测试 | ✅ | 指令解析 35 用例 + 会话核心 mock 测试全部通过 |
+
 ### ⚠️ 已知问题 / 待改进
 
 - **UI 依赖**：识图模式入口、上传输入框等选择器基于 2026-06 上线的 DeepSeek 网页版 UI，改版后需更新 `session_core.py`
@@ -452,4 +462,4 @@ astrbot_plugin_aisearch/
 
 ---
 
-*文档更新日期：2026-08-30（v2.2.13）*
+*文档更新日期：2026-08-30（v2.2.14）*

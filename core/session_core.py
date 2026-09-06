@@ -760,12 +760,29 @@ class DeepSeekSessionCore:
     async def _send_query(self, text: str) -> str:
         """在当前页面发送提问并等待回答（不含会话状态维护）。
 
-        等待策略（v2.2.7 回归简单版）：发送后等待对话框最后一条回复出现，
-        随后对其做**文本稳定检测**（连续 9 秒无变化视为输出完成）。
+        等待策略：**发送前**记录助手回复块的基线（数量 + 最后一块文本），发送后
+        轮询等待「回复块数量增加 或 最后一块文本变化」= 本轮新回复开始渲染
+        （v2.2.14：修复两种误判——连续对话时旧回复仍在，直接对「最后一条」做
+        稳定检测会把上一轮回复当成本轮结果；而回答过快（<2s）时发送后才采样
+        基线会把新回答本身当基线。基线必须在发送前采样），随后对最新回复做
+        **文本稳定检测**（连续 9 秒无变化视为输出完成，v2.2.7）。
         不做回复块计数 / 生成标志 / 补发重试等复杂判断，避免在部分环境下
         卡死或误判；保留 300 秒总上限防止异常情况下无限等待。
         v2.2.13 起每次提问前默认开启「深度思考」（幂等，无需任何参数）。
         """
+        # 发送前基线：上一轮助手回复块数量与文本（此时页面静止，无本轮内容）
+        answer_locator = self.page.locator(
+            "div.ds-markdown.ds-assistant-message-main-content"
+        )
+        baseline_count = 0
+        baseline_text = ""
+        try:
+            baseline_count = await answer_locator.count()
+            if baseline_count > 0:
+                baseline_text = (await answer_locator.last.inner_text()).strip()
+        except Exception:
+            pass
+
         # 默认启动深度思考（普通/识图会话一致；已开启时幂等跳过）
         await self._ensure_deep_think_on()
         await self._type_and_send(text)
@@ -781,23 +798,34 @@ class DeepSeekSessionCore:
         if rejected:
             return "⚠️ DeepSeek 拒绝了这条消息（内容违反使用规范或发送失败），请调整后重试。"
 
-        answer_locator = self.page.locator(
-            "div.ds-markdown.ds-assistant-message-main-content"
-        )
-        try:
-            await answer_locator.last.wait_for(state="visible", timeout=30000)
-        except Exception:
-            # UI 变动兜底：退回通用 .ds-markdown 选择器
-            answer_locator = self.page.locator(".ds-markdown")
-            try:
-                await answer_locator.last.wait_for(state="visible", timeout=30000)
-            except Exception:
-                raise ConversationError("等待 AI 回答超时，请稍后重试。")
+        total_deadline = time.time() + 300  # 总上限，防止异常情况下无限等待
 
-        # 文本稳定检测：连续 9 秒无变化视为输出完成
+        # 阶段 1：等待本轮新回复开始渲染——回复块数量增加，或最后一块文本变化。
+        # 只观察 assistant 专用选择器（不匹配用户消息，避免把用户消息当回复）。
+        new_deadline = time.time() + 180
+        new_ready = False
+        while True:
+            try:
+                cnt = await answer_locator.count()
+                if cnt > baseline_count:
+                    new_ready = True
+                    break  # 出现了新的回复块
+                if cnt > 0:
+                    cur = (await answer_locator.last.inner_text()).strip()
+                    if cur != baseline_text:
+                        new_ready = True
+                        break  # 最后一块文本变化（同一块内更新）
+            except Exception:
+                pass
+            if time.time() > new_deadline or time.time() > total_deadline:
+                break
+            await asyncio.sleep(1)
+        if not new_ready:
+            raise ConversationError("等待 AI 回答超时，请稍后重试。")
+
+        # 阶段 2：文本稳定检测——连续 9 秒无变化视为输出完成
         previous_text = ""
         stable_count = 0
-        total_deadline = time.time() + 300  # 总上限，防止异常情况下无限等待
         while True:
             try:
                 current_text = await answer_locator.last.inner_text()
