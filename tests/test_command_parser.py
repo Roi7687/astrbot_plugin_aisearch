@@ -31,7 +31,7 @@ CASES = [
     ("重置", "new", {}),
     ("新会话", "new", {}),
 
-    # list：无参显示列表（v2.2.11 起 list <id> 便捷切换已移除，切换统一 /ais switch）
+    # list：无参显示列表（list <id> 便捷切换已移除，切换统一 /ais switch）
     ("list", "list", {}),
     ("列表", "list", {}),
     ("session", "list", {}),
@@ -41,15 +41,15 @@ CASES = [
     ("list 2", "list", {}),
     ("列表 3", "list", {}),
     ("session 1", "list", {}),
-    ("list 识图", "list", {}),
 
-    # switch：按本地 id / 模式；无参或参数无效 → 显示列表
+    # switch：按本地 id；无参或参数无效 → 显示列表
+    # （v2.3.0 起模式已合并，不再支持 switch 识图/普通）
     ("switch", "switch", {}),
     ("切换", "switch", {}),
     ("switch 2", "switch", {"local_id": 2}),
     ("切换 1", "switch", {"local_id": 1}),
-    ("switch 识图", "switch", {"mode": "vision"}),
-    ("switch 普通", "switch", {"mode": "normal"}),
+    ("switch 识图", "switch", {}),
+    ("switch 普通", "switch", {}),
     ("switch abc", "switch", {}),
     ("switch 10", "switch", {"local_id": 10}),
 

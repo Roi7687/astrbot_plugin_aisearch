@@ -1,7 +1,7 @@
 # astrbot_plugin_aisearch 开发文档
 
 > **插件名称**：AI搜索  
-> **版本**：v2.2.14  
+> **版本**：v2.3.0  
 > **作者**：Roi  
 > **许可证**：AGPL-3.0  
 > **仓库地址**：https://github.com/Roi7687/astrbot_plugin_aisearch  
@@ -10,9 +10,9 @@
 
 ## 一、项目概述
 
-这是一个 [AstrBot](https://github.com/AstrBotDevs/AstrBot) 插件，通过自动化操控 DeepSeek Chat 网页端，实现**联网 AI 搜索**与**识图模式**功能。用户在聊天中发送 `/ais <关键词>`（或 @机器人 + 图片），插件在后台通过反检测无头浏览器（cloakbrowser）访问 DeepSeek Chat，获取 AI 结果后以 Markdown 格式返回给用户。
+这是一个 [AstrBot](https://github.com/AstrBotDevs/AstrBot) 插件，通过自动化操控 DeepSeek Chat 网页端，实现**联网 AI 搜索**与**图片理解**功能。用户在聊天中发送 `/ais <关键词>`（或 @机器人 + 图片），插件在后台通过反检测无头浏览器（cloakbrowser）访问 DeepSeek Chat，获取 AI 结果后以 Markdown 格式返回给用户。
 
-核心思路：**不调用 API，而是直接自动化操控浏览器**，利用 DeepSeek Chat 自带的联网搜索与识图能力。
+核心思路：**不调用 API，而是直接自动化操控浏览器**，利用 DeepSeek Chat 自带的联网搜索与图片理解能力。
 
 **v2.0.0 变更**：取消单轮 / 多轮区分，统一为 `/ais`；会话持久化 + 空闲自动销毁 + 主动通知；新增识图模式（@机器人 + 图片）、会话查看 / 重置 / 切换功能。
 
@@ -50,6 +50,8 @@
 
 **v2.2.14 变更**：**修复深度思考下连续对话返回上一轮回复**——根因：发送后对「对话框最后一条回复」做 9 秒稳定检测，而深度思考/联网搜索下 AI 数十秒后才开始输出，旧回复一直是「最后一条」，稳定检测直接通过 → 返回旧回复。修复：**发送前**采样助手回复块基线（块数量 + 最后一块文本，仅在 assistant 专用选择器 `div.ds-markdown.ds-assistant-message-main-content` 上采样——通用 `.ds-markdown` 会匹配用户消息，实测会把用户消息当基线导致永远等不到变化），发送后轮询等待「回复块数量增加 或 最后一块文本变化」= 本轮新回复开始渲染（180s 上限），随后对最新回复做 9s 文本稳定检测。**真实浏览器双问验证**：快答（1+1，<2s 渲染）与慢答（相对论，深度思考数十秒）均正确拿到本轮新回复、不会返回上一轮内容。
 
+**v2.3.0 变更**：**合并普通/识图模式，清除模式相关冗余代码**——DeepSeek 网页端改版，官方公告「快速、专家、识图模式已合并升级」（输入区提示：全新模型上线，同时具备日常对话、图片理解与复杂问题解决能力）；实测确认「识图模式」入口已从页面消失（模式栏仅剩「深度思考」「智能搜索」两个开关，原「联网搜索」更名为「智能搜索」），输入框原生支持图片上传（`input[type=file]` accept 含图片类型、multiple）。插件同步调整：① **合并处理链路**：`on_image_message` + `on_auto_message` 合并为单一 `on_message`，文本与图片走同一路径（图片在**当前会话**中上传提问，保持上下文连续，不再另开识图会话）；② **删除模式体系**：`MODE_NORMAL` / `MODE_VISION` / `MODES` / `MODE_LABELS` / `VISION_WELCOME_TEXT` / `VISION_DEBUG_SHOT` 等常量（`DEFAULT_VISION_PROMPT` 改名 `DEFAULT_IMAGE_PROMPT`）、`Conversation.mode` 字段、`current_mode` 属性、`ensure_mode()` / `_latest_of_mode()` 方法、`command_parser.MODE_ALIASES`（`/ais switch 识图/普通` 取消，只按本地 id 切换）；③ **删除识图入口相关代码**：`_switch_to_vision` / `_in_vision_state` / `_click_vision_entry` / `_expand_vision_menu` / `_dump_vision_failure` 及 `VISION_ENTRY_*` / `VISION_EXPAND_LABELS` 常量（约 137 行）与 `vision_debug.png` 留档机制；④ 会话列表不再显示模式列（`👉 1 ｜ 3 条 ｜ 最后活跃 08-30 17:14`），usage/help/README 文案同步。旧数据兼容：conversations.json 中残留的 `mode` 字段被 `Conversation.from_dict` 自动忽略，v2.0 双槽位旧格式仍可迁移。**真实浏览器端到端验证**：先发文本（「收到」）再在同一会话发图（红底白圆），`created=False` 复用会话且 AI 正确回答「主要是红色，图中还有一个白色圆形」。
+
 ---
 
 ## 二、项目结构
@@ -58,12 +60,12 @@
 astrbot_plugin_aisearch/
 ├── core/                      # 核心业务模块
 │   ├── __init__.py
-│   ├── config.py              # 全局配置：路径常量、会话/识图参数 & 自定义异常
+│   ├── config.py              # 全局配置：路径常量、会话参数 & 自定义异常
 │   ├── command_parser.py      # /ais 指令参数解析器（纯函数，可单测）
 │   ├── session_core.py        # 统一持久化会话核心（多会话 + 本地 id 计数）
 │   └── login_core.py          # 登录模块：微信扫码登录 DeepSeek
 ├── tests/                     # 单元测试（mock 掉浏览器依赖）
-│   ├── test_command_parser.py      # 指令解析 35 用例
+│   ├── test_command_parser.py      # 指令解析 34 用例
 │   └── test_session_core_mock.py   # 会话核心 mock 测试（含旧数据迁移）
 ├── __init__.py                # 包初始化文件（空）
 ├── main.py                    # 插件主入口：命令注册、异步调度、主动通知
@@ -89,9 +91,7 @@ astrbot_plugin_aisearch/
 | `IDLE_TIMEOUT_SECONDS` | 会话空闲自动销毁时间（默认 300 秒） |
 | `MAX_IMAGE_BYTES` | 单张图片大小上限（超过自动压缩） |
 | `AUTO_TRIGGER` | 自动触发：@机器人/私聊直接提问无需 /ais（默认 True） |
-| `DEFAULT_VISION_PROMPT` | 仅发图不带文字时的默认提问 |
-| `VISION_WELCOME_TEXT` | 识图模式新会话欢迎语（用于验证切换成功） |
-| `MODE_NORMAL` / `MODE_VISION` | 会话模式常量（normal / vision） |
+| `DEFAULT_IMAGE_PROMPT` | 仅图片无文字时的默认提问 |
 | `AuthError` / `ConversationError` | 自定义异常 |
 
 ### 3.2 `core/command_parser.py` — 指令解析器（纯函数）
@@ -103,12 +103,11 @@ astrbot_plugin_aisearch/
 **返回的 action**：`usage` / `help` / `send` / `new` / `list` / `switch`
 
 **解析规则**：
-- 开头的 `-v` 兼容旗标（v2.2.10 起无实际效果，解析时剥离避免旗标文本被当问题发送）；`-t` v2.2.11 起彻底不识别（按普通文本处理）
+- 开头的 `-v` 兼容旗标（无实际效果，解析时剥离避免旗标文本被当问题发送）；`-t` v2.2.11 起彻底不识别（按普通文本处理）
 - 首个 token 命中子命令关键词表（含中文别名：重置/状态/列表/切换/帮助）→ 子命令
   - `session` / `状态` / `会话` / `info` / `查看` 均为 `list` 的别名（已合并）
   - `switch` 后跟数字 → `{"local_id": int}`（按本地 id 切换）；`list` 不再接受目标参数（v2.2.11）
-  - `switch` 后跟模式别名（识图/普通/图片/文本...）→ `{"mode": "vision"|"normal"}`
-  - `switch` 无参或参数无效 → `{"local_id": None, "mode": None}`（调用方显示列表）
+  - `switch` 无参或参数无效 → `{}`（调用方显示列表）
 - 其余情况 → send，payload 为 `{"text": str}`（当前会话提问）
 - 其余 token 原样拼接为提问文本
 
@@ -116,30 +115,27 @@ astrbot_plugin_aisearch/
 
 | 类 / 方法 | 说明 |
 |-----------|------|
-| `Conversation` | 会话元数据 dataclass（local_id / mode / session_id / url / message_count / created_at / last_active / destroyed） |
+| `Conversation` | 会话元数据 dataclass（local_id / session_id / url / message_count / created_at / last_active / destroyed；**mode 字段 v2.3.0 已移除**，旧数据中的 mode 自动忽略） |
 | `DeepSeekSessionCore` | 统一会话核心：`conversations: dict[local_id, Conversation]` + `next_id` 计数器 + `current_id` |
-| `current_conversation` / `current_mode` | 当前会话 / 当前会话模式（只读属性） |
-| `send_message(text, mode=None)` | 在当前会话（或指定模式会话）发送文本，返回 `(是否新建, 回答文本)` |
-| `send_image_message(text, paths)` | 识图会话上传图片 + 发送提问，返回 `(是否新建, 回答文本)` |
-| `ensure_mode(mode)` | 确保当前会话为指定模式：复用该模式最近活跃会话或新建，返回 `(conv, 是否新建)` |
+| `current_conversation` | 当前会话（只读属性） |
+| `send_message(text)` | 在当前会话发送文本（无会话自动创建），返回 `(是否新建, 回答文本)` |
+| `send_image_message(text, paths)` | 在**当前会话**上传图片 + 发送提问（v2.3.0 起图文同会话），返回 `(是否新建, 回答文本)` |
 | `switch_conversation(local_id)` | 按本地 id 切换；id 不存在（含已销毁被移除）报错，返回 `(conv, 是否重建)` |
-| `new_conversation(mode=MODE_NORMAL)` | 创建新会话（分配新 id）并设为当前；**v2.2.10 起总是新建普通会话，不继承当前模式**；不销毁旧会话 |
+| `new_conversation()` | 创建新会话（分配新 id）并设为当前；不销毁旧会话 |
 | `destroy_conversation(local_id)` | 销毁空闲超时的会话：服务器端删除 + 记录移除（v2.2.11）；**锁内校验真实空闲**、全部销毁后 id 归 1（v2.2.12），返回是否真的有会话被销毁 |
 | `conversation_summary(local_id)` / `list_summary()` | 单个 / 全部会话展示数据（按 id 升序） |
 | `close()` | 关闭浏览器（插件卸载 / 登录刷新） |
 
 **设计要点**：
-- **多会话 + 本地 id**：本地维护会话列表（普通/识图混合），`next_id` 本地递增计数（1、2、3...），持久化于 conversations.json；重启后 id 连续不重复；**v2.2.12 起没有任何存活会话时 id 归 1**（`_register` 分配前 / 全部销毁后 / 加载空文件时），新会话从 #1 重新开始
+- **多会话 + 本地 id**：本地维护会话列表，`next_id` 本地递增计数（1、2、3...），持久化于 conversations.json；重启后 id 连续不重复；**v2.2.12 起没有任何存活会话时 id 归 1**（`_register` 分配前 / 全部销毁后 / 加载空文件时），新会话从 #1 重新开始
 - **串行化**：所有页面操作经 `asyncio.Lock` 互斥，避免并发命令竞态
 - **惰性创建**：首次使用时才启动浏览器 / 开启新对话
-- **模式复用**：`ensure_mode('vision')` 优先复用该模式最近活跃的未销毁会话，无则新建；**但 `send_image_message` 例外（v2.2.9）：每次传图强制新建识图会话**（多图同会话易致回复异常）
 - **销毁即删除记录（v2.2.11，v2.2.12 强化）**：空闲销毁时从 conversations.json 移除该记录（用户无法再访问已销毁会话）；销毁当前会话时重置 current_id；**锁内权威校验真实空闲**——等待锁期间会话有新活动则放弃销毁（v2.2.12，杜绝「对话中被销毁」）；页面失效路径同样删除记录而非标记 destroyed（v2.2.12）；加载时自动清理历史 destroyed 数据并立即落盘；`Conversation.destroyed` 字段仅作历史兼容
-- **识图模式切换**：新对话页点击「识图模式」入口（精确标签 → 模糊文本 → 展开「+ / 更多」菜单多策略查找，中/英文标签均支持），以欢迎语「使用识图模式开始对话」或激活态类名验证；查找失败时保存 vision_debug.png 截图留档
-- **图片上传**：Playwright `set_input_files` 注入 `input[type=file]` → 等 blob 缩略图出现 → **双路上传完成确认**（`_wait_upload_finished`：① 监听上传网络请求 POST/PUT 含 upload/file 全部响应；② DOM 上传中标志消失兜底），确认完成才发送提问，避免慢速网络下「文本已发送但图片未传完」
+- **图片上传（图文同会话）**：Playwright `set_input_files` 注入 `input[type=file]`（新 UI accept 含图片类型且支持多选） → 等 blob 缩略图出现 → **双路上传完成确认**（`_wait_upload_finished`：① 监听上传网络请求 POST/PUT 含 upload/file 全部响应；② DOM 上传中标志消失兜底），确认完成才发送提问，避免慢速网络下「文本已发送但图片未传完」
 - **深度思考（v2.2.13 起默认开启）**：每次提问前 `_ensure_deep_think_on()` **幂等**确保开启——`_locate_by_text` 定位文本为「深度思考」的 `.ds-toggle-button`，检测激活态（class 含 selected/active 或 aria-pressed/aria-checked=true），未激活才点击（2026-08 真实浏览器实测该元素有效；再次点击会关闭，故必须幂等）；找不到仅首次警告后降级不阻塞。无需任何参数/配置。联网搜索不自动操作（跟随 DeepSeek 网页端设置，默认开）
 - **答案等待**（v2.2.14 基线方案）：**发送前**在 assistant 专用选择器（`div.ds-markdown.ds-assistant-message-main-content`，不匹配用户消息）采样回复块基线（数量 + 最后一块文本），发送后轮询等待「回复块数量增加 或 最后一块文本变化」= 本轮新回复开始渲染（180s 上限），随后做**文本稳定检测**（连续 9 秒无变化视为输出完成，总上限 300s）——修复深度思考/联网搜索下 AI 延迟输出时把上一轮回复当成本轮结果的问题；不做回复块计数/生成标志/补发重试等复杂判断，避免部分环境下卡死；保留引用角标清理与 HTML→Markdown 转换
 - **会话删除**：`POST /api/v0/chat_session/delete`（Bearer 令牌嗅探），新旧 URL 格式（`/a/chat/s/<uuid>` 与 `/s/<id>`）均兼容
-- **元数据持久化**：每次变更写入 conversations.json（`{"next_id", "current_id", "conversations"}` 新格式；旧版 `{mode: {...}}` 双槽位格式自动迁移为 id 1=normal、2=vision）
+- **元数据持久化**：每次变更写入 conversations.json（`{"next_id", "current_id", "conversations"}`）；旧版 `{mode: {...}}` 双槽位格式仍可迁移（v2.3.0 起忽略其中的 mode 字段）
 
 ### 3.4 `main.py` — 插件主入口
 
@@ -147,8 +143,7 @@ astrbot_plugin_aisearch/
 |-----------|------|
 | `CloakSearchPlugin` | 插件主类 |
 | `ai_search_command()` | `/ais` 统一指令（send/new/session/list/switch/help） |
-| `on_image_message()` | `@filter.event_message_type(ALL)` 图片消息处理：@机器人 + 图片（或私聊图片）→ 识图会话 |
-| `on_auto_message()` | `@filter.event_message_type(ALL)` 自动触发：@机器人/私聊文本（非指令、非图片）→ 直接 AI 搜索对话，无需 /ais |
+| `on_message()` | `@filter.event_message_type(ALL)` 统一消息处理（v2.3.0 合并原 `on_image_message` + `on_auto_message`）：@机器人/私聊的**文本或图片** → 当前会话提问（有图片则先上传，无文字用 `DEFAULT_IMAGE_PROMPT`），无需 /ais |
 | `_respond()` | 统一回复：刷新空闲计时 + 「已开启新会话」前缀 + 键盘按钮；返回空串表示已发送 |
 | `_arm_idle_timer()` / `_idle_waiter()` | 每会话独立空闲计时器：每次提问/切换/新建后重置；到点后**按真实空闲时间（last_active）二次校验**，有新活动则重新计时，超时**静默销毁**（不推送通知，避免刷屏） |
 | `_is_self_message()` | 跳过机器人自己发出的消息（部分平台会回传自身消息，防止自我回复循环） |
@@ -166,17 +161,16 @@ astrbot_plugin_aisearch/
 | `/ais new`（reset/重置） | 开启新的**普通会话**（旧会话保留，可按 id 切回） |
 | `/ais list`（列表/状态/session） | 查看会话列表（带本地 id，👉 为当前；**已关闭的不显示**） |
 | `/ais switch <id>`（切换） | 按本地 id 切换会话（已关闭的会话记录已删除，需新建） |
-| `/ais switch 识图/普通` | 按模式切换（复用该模式最近会话，无则新建） |
 | `/ais help`（帮助） | 帮助 |
 | `/cloak登录` | 微信扫码登录 |
 
-> `-v` 旗标自 v2.2.10 起保留解析（兼容剥离）但无实际效果（识图由发送图片自动触发，v2.2.9 起每次传图新建识图会话）；`-t` 旗标 v2.2.11 起彻底不识别——深度思考无需任何旗标，v2.2.13 起每次提问自动开启。
+> `-v` 旗标保留解析（兼容剥离）但无实际效果（图片由发送图片自动处理）；`-t` 旗标 v2.2.11 起彻底不识别——深度思考无需任何旗标，每次提问自动开启。
 
 **防刷屏与指令保护策略**：
 - 会话空闲超时**静默销毁**，不推送任何主动通知（此前每会话超时都会向聊天窗口推送一条）
-- 自动触发 / 识图处理器跳过机器人自己发出的消息（`sender_id == self_id`），防止自我回复循环
-- 自动触发 / 识图处理器跳过**指令消息**（`_is_command_message`：activated_handlers 含 Command 类 filter 即让路；waking_check 已剥离指令前缀，不能靠文本判断），避免拦截 /cloak登录、/ais 及其他插件/内置指令
-- 回复只跟随用户提问产生（指令 / 自动触发 / 识图各一条），QQ 官方平台键盘按钮与回复合并为一条消息
+- 消息处理器跳过机器人自己发出的消息（`sender_id == self_id`），防止自我回复循环
+- 消息处理器跳过**指令消息**（`_is_command_message`：activated_handlers 含 Command 类 filter 即让路；waking_check 已剥离指令前缀，不能靠文本判断），避免拦截 /cloak登录、/ais 及其他插件/内置指令
+- 回复只跟随用户提问产生（指令 / 自动触发 各一条），QQ 官方平台键盘按钮与回复合并为一条消息
 
 ### 3.5 `core/login_core.py` — 登录模块
 
@@ -200,21 +194,22 @@ astrbot_plugin_aisearch/
 
 ## 五、数据流
 
-### 自动触发（@机器人/私聊文本，v2.2.0 新增）
+### 自动触发（@机器人/私聊的文本或图片，v2.2.0 新增；v2.3.0 图文合并）
 
 ```
-用户 @机器人 发送文字（或私聊直接发送）
+用户 @机器人 发送文字/图片（或私聊直接发送；也可引用一条含图片的消息）
        │
        ▼
-  on_auto_message()（EventMessageType.ALL）
-       ├─ AUTO_TRIGGER 关闭 / 事件已停止 / 机器人自身消息 → 返回
-       ├─ 空文本 → 返回
+  on_message()（EventMessageType.ALL）
+       ├─ 事件已停止 / 机器人自身消息 → 返回
        ├─ 指令消息（activated_handlers 含 Command 类 filter）→ 返回，交给指令处理器
-       ├─ 含图片 → 返回（交给 on_image_message 识图）
+       ├─ 无文本且无图片 → 返回
+       ├─ 纯文本且 AUTO_TRIGGER=False → 返回（图片不受该开关限制）
        ├─ 群聊未@未唤醒 → 返回（不拦截正常聊天）
        └─ 命中 → event.stop_event()（阻止默认 LLM 响应）
        ▼
-  session.send_message(text) → (created, result)
+  有图片 → send_image_message(text, paths)（当前会话上传图片 + 提问，无文字用默认提示词）
+  仅文本 → send_message(text)
        ▼
   _respond()：刷新空闲计时 + 前缀 + 键盘按钮 → 回复
 ```
@@ -225,16 +220,15 @@ astrbot_plugin_aisearch/
 用户发送提问（/ais 问题 或 @机器人 问题）
        │
        ▼
-  ai_search_command() / on_auto_message()
+  ai_search_command() / on_message()
        │  send: 直接在当前会话提问（-v 兼容剥离无效果；-t 已不识别）
        ▼
   DeepSeekSessionCore.send_message(text) → (created, result)
        │
-       ├─ ensure_current_locked(None)：
-       │    ├─ 当前会话匹配？ ──→ _goto_session(conv.url)
-       │    └─ 无当前会话？ ──→ _create_conversation(normal) + _register(分配新 id)
-       │                          ├─ _open_new_chat()（新对话页）
-       │                          └─ vision？ _switch_to_vision()（点击识图模式）
+       ├─ ensure_current_locked()：
+       │    ├─ 有当前会话？ ──→ _goto_session(conv.url)（失效则删记录后新建）
+       │    └─ 无当前会话？ ──→ _create_conversation() + _register(分配新 id)
+       │                          └─ _open_new_chat()（新对话页）
        │
        ├─ _send_query()：确保「深度思考」开启（幂等，v2.2.13）→ 输入发送
        ├─ 发送前基线 → 等新回复块出现/文本变化（v2.2.14）→ 稳定 9s → HTML → Markdown
@@ -247,22 +241,20 @@ astrbot_plugin_aisearch/
   _arm_idle_timer(local_id) → 300s 无活动 → destroy（静默，不推送通知）
 ```
 
-### 识图（@机器人 + 图片，v2.2.8 起支持引用消息中的图片；v2.2.9 起每图一个新会话）
+### 图片提问（@机器人 + 图片，v2.2.8 起支持引用消息中的图片；v2.3.0 起图文同会话）
 
 ```
 群聊 @机器人 + 图片（或私聊图片；也可引用一条含图片的消息）
        │
        ▼
-  on_image_message()（EventMessageType.ALL）
-       ├─ 无图片 / 未@ → 直接返回，不拦截（_collect_images 同时检查当前消息与 Reply.chain）
-       ├─ 命中 → event.stop_event()（阻止默认 LLM 响应）
+  on_message()（EventMessageType.ALL）→ _collect_images()（当前消息 + Reply.chain）
        ▼
   _prepare_image_paths()（convert_to_file_path / 下载 / PIL 压缩）
        ▼
   send_image_message(text, paths) → (created, result)
-       ├─ _create_conversation(MODE_VISION) + _register（每次传图强制新建识图会话）
-       ├─ set_input_files 上传 → 等 blob 缩略图
-       └─ 输入文字（无则默认提示词）→ 发送 → 等待答案
+       ├─ ensure_current_locked()（复用当前会话；无则新建）
+       ├─ set_input_files 上传 → blob 缩略图 + 双路上传完成确认
+       └─ 输入文字（无则 DEFAULT_IMAGE_PROMPT）→ 发送 → 等待答案
        ▼
   _respond() → 返回结果 + 键盘按钮
 ```
@@ -433,15 +425,25 @@ astrbot_plugin_aisearch/
 | 快答/慢答双场景验证 | ✅ | 真实浏览器：1+1 快答（<2s 渲染）与相对论慢答（深度思考数十秒）连续两问均返回各自新回复，不会错拿上一轮内容 |
 | 单元测试 | ✅ | 指令解析 35 用例 + 会话核心 mock 测试全部通过 |
 
+### ✅ v2.3.0 已完成功能
+
+| 功能 | 状态 | 说明 |
+|------|------|------|
+| 普通/识图模式合并 | ✅ | DeepSeek 官方合并「快速/专家/识图模式」后，插件统一为单一会话类型：文本与图片都在当前会话处理，图片不再另开识图会话 |
+| 消息处理器合并 | ✅ | `on_image_message` + `on_auto_message` → 单一 `on_message`（图片走 `send_image_message`，文本走 `send_message`） |
+| 模式体系删除 | ✅ | 删除 MODE_* / MODES / MODE_LABELS / VISION_* 常量、`Conversation.mode`、`current_mode`、`ensure_mode()`、`_latest_of_mode()`、`MODE_ALIASES`（约 200 行） |
+| 识图入口代码删除 | ✅ | 删除 `_switch_to_vision` / `_in_vision_state` / `_click_vision_entry` / `_expand_vision_menu` / `_dump_vision_failure` 及入口标签常量、调试截图机制（约 137 行） |
+| 文案/列表同步 | ✅ | 会话列表去掉模式列；usage/help/README 全部改写为「图文同会话」表述 |
+| 单元测试 | ✅ | 指令解析 34 用例 + 会话核心 mock 测试（新增「mode 字段已移除」「旧数据 mode 被忽略」用例）全部通过；真实浏览器图文同会话端到端验证通过 |
+
 ### ⚠️ 已知问题 / 待改进
 
-- **UI 依赖**：识图模式入口、上传输入框等选择器基于 2026-06 上线的 DeepSeek 网页版 UI，改版后需更新 `session_core.py`
-- **未实机验证**：识图全流程（登录态下）需在真实环境验证，选择器如有出入按日志调整
+- **UI 依赖**：深度思考开关、图片上传输入框等选择器基于 2026-08 上线的 DeepSeek 网页版 UI（模式合并版），改版后需更新 `session_core.py`
+- **图片链路已实测**：真实登录态下「文本 + 图片同会话」端到端验证通过（上传红色圆图 → AI 正确回答颜色与形状）
 - 多图片消息的图片顺序与文字绑定关系待实测确认
 
 ### 🔮 后续开发建议
 
-- 支持「专家模式」等其他一级对话模式
 - 会话列表持久化到侧边栏（DeepSeek 网页端会话列表）的同步清理
 - 多图分次发送时的进度提示
 - 将选择器抽离为可配置项，降低网页改版维护成本
@@ -452,14 +454,15 @@ astrbot_plugin_aisearch/
 
 1. 首次使用前，发送 `/cloak登录` 微信扫码登录
 2. **提问**：@机器人 直接发消息（或私聊直接发）即可自动提问，无需指令；`/ais <问题>` 亦可
-3. **识图**：@机器人 + 图片（或私聊发图）自动进入识图会话
+3. **图片**：@机器人 + 图片（或私聊发图）自动在当前会话中理解图片并回答
 4. **会话管理**（仅切换时需要指令）：`/ais list` 查看全部会话（带本地 id）；`/ais switch <id>` 按 id 切换；`/ais new` 开启新会话（旧会话保留）
 5. 示例：
    - @机器人 今天有什么大新闻（自动触发，深度思考自动开启，联网搜索跟随网页端设置）
-   - 群里 @机器人 发一张截图 → 自动识图分析
+   - 群里 @机器人 发一张截图 → 自动理解图片并回答（与文字同一会话，上下文连续）
    - `/ais list` → `/ais switch 2` → @机器人 这张图里有什么公式
 6. 空闲 300 秒无活动，会话自动关闭（静默，不推送通知）；已关闭的会话按 id 切换时自动重建
+7. DeepSeek 已把「快速 / 专家 / 识图模式」合并为统一对话，插件同步取消模式区分：文本与图片都在当前会话中处理
 
 ---
 
-*文档更新日期：2026-08-30（v2.2.14）*
+*文档更新日期：2026-08-30（v2.3.0）*

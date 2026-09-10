@@ -4,7 +4,7 @@ stub_cb = types.SimpleNamespace(launch_async=lambda **kw: None)
 sys.modules['cloakbrowser'] = stub_cb
 sys.modules['markdownify'] = types.SimpleNamespace(markdownify=lambda html, **kw: "[md]")
 
-from core.config import MODE_NORMAL, MODE_VISION, CONVERSATIONS_FILE
+from core.config import CONVERSATIONS_FILE
 from core.session_core import DeepSeekSessionCore, Conversation
 
 def write_conv_file(data):
@@ -17,15 +17,16 @@ async def main():
     assert core.conversations == {}, "init"
     assert core.next_id == 1
     assert core.current_id is None
-    assert core.current_mode == MODE_NORMAL
     assert core.current_conversation is None
+    # v2.3.0：模式已合并，Conversation 不再有 mode 字段
+    assert not hasattr(Conversation(), "mode"), "mode field should be removed"
 
     # 2. 销毁不存在的会话
     ok = await core.destroy_conversation(1)
     assert ok is False, "destroy missing"
 
     # 3. 手工登记一个会话并检查摘要
-    conv = Conversation(local_id=1, mode=MODE_NORMAL, session_id="test-123",
+    conv = Conversation(local_id=1, session_id="test-123",
                         url="https://chat.deepseek.com/a/chat/s/test-123",
                         message_count=2, created_at=100.0, last_active=200.0)
     core.conversations[1] = conv
@@ -33,12 +34,13 @@ async def main():
     core._save_conversations()
     s = core.conversation_summary(1)
     assert s["exists"] and s["session_id"] == "test-123" and s["message_count"] == 2, str(s)
-    assert s["is_current"] is True and s["local_id"] == 1 and s["label"] == "普通对话", str(s)
+    assert s["is_current"] is True and s["local_id"] == 1, str(s)
+    assert "mode" not in s and "label" not in s, f"mode/label should be gone: {s}"
     s2 = core.conversation_summary(2)
     assert s2["exists"] is False, str(s2)
 
     # 4. 列表摘要按 id 升序
-    core.conversations[2] = Conversation(local_id=2, mode=MODE_VISION, message_count=1,
+    core.conversations[2] = Conversation(local_id=2, message_count=1,
                                          created_at=1.0, last_active=1.0)
     ids = [it["local_id"] for it in core.list_summary()]
     assert ids == [1, 2], ids
@@ -54,10 +56,10 @@ async def main():
     # 6. 重启加载（新格式；已销毁记录不保留）
     core2 = DeepSeekSessionCore()
     assert 1 not in core2.conversations, "reload drops destroyed"
-    assert core2.conversations[2].mode == MODE_VISION
+    assert core2.conversations[2].session_id == ""
     assert core2.current_id is None, "reload current_id"
 
-    # 7. 旧版双槽位格式自动迁移为本地 id（normal=1, vision=2）
+    # 7. 旧版双槽位格式自动迁移为本地 id（normal=1, vision=2；mode 字段被忽略）
     write_conv_file({
         "normal": {"mode": "normal", "session_id": "old-n",
                    "url": "https://chat.deepseek.com/a/chat/s/old-n",
@@ -70,16 +72,16 @@ async def main():
     })
     core3 = DeepSeekSessionCore()
     assert set(core3.conversations) == {1, 2}, list(core3.conversations)
-    assert core3.conversations[1].mode == MODE_NORMAL
-    assert core3.conversations[2].mode == MODE_VISION
+    assert core3.conversations[1].session_id == "old-n"
+    assert core3.conversations[2].session_id == "old-v"
     assert core3.next_id == 3, "next_id after migrate"
     assert core3.current_id == 2, "migrate picks latest alive"
 
     # 7b. 旧格式中含已销毁槽位：迁移后清理（v2.2.11）
     write_conv_file({
-        "normal": {"mode": "normal", "message_count": 1,
+        "normal": {"session_id": "old-dead", "message_count": 1,
                    "created_at": 1.0, "last_active": 1.0, "destroyed": True},
-        "vision": {"mode": "vision", "message_count": 1,
+        "vision": {"session_id": "old-alive", "message_count": 1,
                    "created_at": 2.0, "last_active": 2.0, "destroyed": False},
     })
     core3b = DeepSeekSessionCore()
@@ -97,7 +99,7 @@ async def main():
     assert ok is True
     assert core.conversations == {}
     assert core.next_id == 1, "next_id resets when all destroyed"
-    conv_r = Conversation(mode=MODE_NORMAL, created_at=1.0, last_active=1.0)
+    conv_r = Conversation(created_at=1.0, last_active=1.0)
     core._register(conv_r)
     assert conv_r.local_id == 1 and core.next_id == 2, "new session restarts at 1"
     assert core.current_id == 1
@@ -108,17 +110,27 @@ async def main():
     assert core_empty.conversations == {}
     assert core_empty.next_id == 1, "empty file resets next_id"
 
+    # 8d. 新格式文件中残留 mode 字段（旧版本数据）应被安全忽略（v2.3.0）
+    write_conv_file({"next_id": 5, "current_id": 3, "conversations": {
+        "3": {"local_id": 3, "mode": "vision", "session_id": "legacy-3",
+              "url": "https://chat.deepseek.com/a/chat/s/legacy-3",
+              "message_count": 4, "created_at": 1.0, "last_active": 2.0,
+              "destroyed": False}}})
+    core4 = DeepSeekSessionCore()
+    assert set(core4.conversations) == {3}, list(core4.conversations)
+    assert core4.conversations[3].session_id == "legacy-3"
+    assert core4.current_id == 3
+
     # 9. _mark_active 发送后回写会话 URL / ID，并更新 current
     import types as _t
     core.page = _t.SimpleNamespace(url="https://chat.deepseek.com/a/chat/s/abc-123-456")
-    conv3 = Conversation(local_id=9, mode=MODE_VISION, created_at=1.0, last_active=1.0)
+    conv3 = Conversation(local_id=9, created_at=1.0, last_active=1.0)
     core.conversations[9] = conv3
     core._mark_active(conv3)
     assert conv3.message_count == 1
     assert conv3.session_id == "abc-123-456"
     assert "/a/chat/s/" in conv3.url
     assert core.current_id == 9
-    assert core.current_mode == MODE_VISION
 
     # 10. 切换不存在的 id 报错
     try:
