@@ -1,10 +1,17 @@
-import sys, os, asyncio, types, traceback, json
+import sys, os, asyncio, types, traceback, json, shutil, tempfile
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 stub_cb = types.SimpleNamespace(launch_async=lambda **kw: None)
 sys.modules['cloakbrowser'] = stub_cb
 sys.modules['markdownify'] = types.SimpleNamespace(markdownify=lambda html, **kw: "[md]")
 
-from core.config import CONVERSATIONS_FILE
+import core.session_core as session_core
+
+# 隔离线上会话元数据：测试只读写临时目录（否则会读到真实会话导致首个断言失败，
+# 且结尾的 os.remove 会删掉线上 conversations.json）
+TMP_DIR = tempfile.mkdtemp(prefix="ais_session_mock_")
+CONVERSATIONS_FILE = os.path.join(TMP_DIR, "conversations.json")
+session_core.CONVERSATIONS_FILE = CONVERSATIONS_FILE
+
 from core.session_core import DeepSeekSessionCore, Conversation
 
 def write_conv_file(data):
@@ -139,8 +146,7 @@ async def main():
     except Exception as e:
         assert "999" in str(e), str(e)
 
-    if os.path.exists(CONVERSATIONS_FILE):
-        os.remove(CONVERSATIONS_FILE)
+    shutil.rmtree(TMP_DIR, ignore_errors=True)
     print("ALL MOCK TESTS PASSED")
 
 try:

@@ -1,7 +1,7 @@
 # astrbot_plugin_aisearch 开发文档
 
 > **插件名称**：AI搜索  
-> **版本**：v2.3.0  
+> **版本**：v2.3.1  
 > **作者**：Roi  
 > **许可证**：AGPL-3.0  
 > **仓库地址**：https://github.com/Roi7687/astrbot_plugin_aisearch  
@@ -52,6 +52,8 @@
 
 **v2.3.0 变更**：**合并普通/识图模式，清除模式相关冗余代码**——DeepSeek 网页端改版，官方公告「快速、专家、识图模式已合并升级」（输入区提示：全新模型上线，同时具备日常对话、图片理解与复杂问题解决能力）；实测确认「识图模式」入口已从页面消失（模式栏仅剩「深度思考」「智能搜索」两个开关，原「联网搜索」更名为「智能搜索」），输入框原生支持图片上传（`input[type=file]` accept 含图片类型、multiple）。插件同步调整：① **合并处理链路**：`on_image_message` + `on_auto_message` 合并为单一 `on_message`，文本与图片走同一路径（图片在**当前会话**中上传提问，保持上下文连续，不再另开识图会话）；② **删除模式体系**：`MODE_NORMAL` / `MODE_VISION` / `MODES` / `MODE_LABELS` / `VISION_WELCOME_TEXT` / `VISION_DEBUG_SHOT` 等常量（`DEFAULT_VISION_PROMPT` 改名 `DEFAULT_IMAGE_PROMPT`）、`Conversation.mode` 字段、`current_mode` 属性、`ensure_mode()` / `_latest_of_mode()` 方法、`command_parser.MODE_ALIASES`（`/ais switch 识图/普通` 取消，只按本地 id 切换）；③ **删除识图入口相关代码**：`_switch_to_vision` / `_in_vision_state` / `_click_vision_entry` / `_expand_vision_menu` / `_dump_vision_failure` 及 `VISION_ENTRY_*` / `VISION_EXPAND_LABELS` 常量（约 137 行）与 `vision_debug.png` 留档机制；④ 会话列表不再显示模式列（`👉 1 ｜ 3 条 ｜ 最后活跃 08-30 17:14`），usage/help/README 文案同步。旧数据兼容：conversations.json 中残留的 `mode` 字段被 `Conversation.from_dict` 自动忽略，v2.0 双槽位旧格式仍可迁移。**真实浏览器端到端验证**：先发文本（「收到」）再在同一会话发图（红底白圆），`created=False` 复用会话且 AI 正确回答「主要是红色，图中还有一个白色圆形」。
 
+**v2.3.1 变更**：**修复 QQ 群引用（回复）消息解析——被引用内容丢失导致 AI 答非所问**。现象（2026-10-11 01:17:41 线上日志）：群友「引用一条消息 + @机器人 + 回答一下这个问题」，DeepSeek 收到后回「请把你想让我回答的问题发出来」。根因：AstrBot 的消息链是 `[Reply(被引用内容), At(机器人), Plain(自己的话)]`，而 `event.get_message_str()` **只含「自己的话」**——被引用的文本/图片只存在于 `Reply` 组件（`chain` / `message_str`）中，插件此前只取 `message_str` 就发给 DeepSeek，「这个问题」指代不明。修复（新增 `core/quote_parser.py` 纯函数模块 + `main.py` 接线）：① **引用文本入 prompt**——`[引用消息] 被引用内容` 在前、用户自己的话在后（有 `sender_nickname` 时标注发送者；QQ 官方平台昵称为空则用 `[引用消息]`）；② **引用图片上传**——`Reply.chain` 中的 `Image` 单独收集并上传（此前混在 `_collect_images` 里，v2.3.1 起统一由 `_collect_quote` 提取，避免漏取/重复取）；③ **优先复用 AstrBot 官方解析工具**（`astrbot.core.utils.quoted_message.extract_quoted_message_{text,images}`，AstrBot ≥ 4.4）——可处理远程 `get_msg`、合并转发等跨平台场景，旧版本或调用失败时回退本地 `quote_parser`；为防群里无关引用消息触发远程拉取，`is_at` 判断前置到解析之前；④ **默认提示词补位**——只有引用、自己没打字时用 `DEFAULT_QUOTE_PROMPT`（新增，引用图片无文字仍用 `DEFAULT_IMAGE_PROMPT`）；⑤ **引用解析为空且自己没说话 → 放行**（不再向 DeepSeek 发空提问）；⑥ **可观测性**——每次提问输出 `📝 [AIS] 本轮提问（N 字…）`、解析到引用时输出 `🔗 [AIS] 解析到引用消息：…`（DEBUG）。**顺带修复**：⑦ `/ais` 指令路径同样带上引用文本/图片（此前只有自动触发路径）；⑧ **插件 `terminate()` 清理**——`Star.terminate` 是空实现，重载后旧实例的空闲计时器仍在运行并可能销毁**新实例正在对话**的会话（日志实测：旧实例 01:16:13 销毁的会话，新实例 01:17 仍在其内提问），浏览器进程也不退出；现于卸载/重载时取消全部计时器并 `session.close()`；⑨ **测试隔离修复**——`test_session_core_mock.py` 原先读写并 `os.remove` **线上** `conversations.json`（有数据时首个断言即失败、且会删掉线上会话元数据），改为指向临时目录。单元测试新增 `tests/test_quote_parser.py`（引用解析与 prompt 组装，纯函数）与 `tests/test_quote_flow.py`（真实 AstrBot 消息链驱动 `on_message`/`ai_search_command` 的 12 项端到端断言）。
+
 ---
 
 ## 二、项目结构
@@ -62,11 +64,14 @@ astrbot_plugin_aisearch/
 │   ├── __init__.py
 │   ├── config.py              # 全局配置：路径常量、会话参数 & 自定义异常
 │   ├── command_parser.py      # /ais 指令参数解析器（纯函数，可单测）
+│   ├── quote_parser.py        # 引用消息（Reply）解析与提问组装（纯函数，可单测）
 │   ├── session_core.py        # 统一持久化会话核心（多会话 + 本地 id 计数）
 │   └── login_core.py          # 登录模块：微信扫码登录 DeepSeek
 ├── tests/                     # 单元测试（mock 掉浏览器依赖）
 │   ├── test_command_parser.py      # 指令解析 34 用例
-│   └── test_session_core_mock.py   # 会话核心 mock 测试（含旧数据迁移）
+│   ├── test_quote_parser.py        # 引用消息解析 / prompt 组装（纯函数）
+│   ├── test_session_core_mock.py   # 会话核心 mock 测试（含旧数据迁移，隔离临时目录）
+│   └── test_quote_flow.py          # 引用消息端到端（真实 AstrBot 消息链驱动处理器）
 ├── __init__.py                # 包初始化文件（空）
 ├── main.py                    # 插件主入口：命令注册、异步调度、主动通知
 ├── auth_state.json            # 持久化存储的登录凭证（cookies/localStorage）
@@ -92,7 +97,9 @@ astrbot_plugin_aisearch/
 | `MAX_IMAGE_BYTES` | 单张图片大小上限（超过自动压缩） |
 | `AUTO_TRIGGER` | 自动触发：@机器人/私聊直接提问无需 /ais（默认 True） |
 | `DEFAULT_IMAGE_PROMPT` | 仅图片无文字时的默认提问 |
+| `DEFAULT_QUOTE_PROMPT` | 仅引用消息、自己没打字时的默认提问（v2.3.1） |
 | `AuthError` / `ConversationError` | 自定义异常 |
+| `ImagePrepareError` | `ConversationError` 子类：图片全部下载/解析失败（v2.3.1，处理器据此回「⚠️」而非「❌ 搜索失败」） |
 
 ### 3.2 `core/command_parser.py` — 指令解析器（纯函数）
 
@@ -111,7 +118,19 @@ astrbot_plugin_aisearch/
 - 其余情况 → send，payload 为 `{"text": str}`（当前会话提问）
 - 其余 token 原样拼接为提问文本
 
-### 3.3 `core/session_core.py` — 统一会话核心（全异步，多会话 + 本地 id）
+### 3.3 `core/quote_parser.py` — 引用消息解析（纯函数）
+
+| 函数 | 说明 |
+|------|------|
+| `find_reply(components)` | 返回消息链中第一个 `Reply` 组件（无则 None） |
+| `quote_sender(reply)` | 被引用消息的发送者昵称（QQ 官方平台为空字符串） |
+| `extract_quote_text(reply)` | 被引用文本：`chain` 中的 `Plain`/`At` 文本优先，`Reply.message_str` 兜底；非文本段转 `[图片]`/`[表情]`/`[转发消息]` 等占位符 |
+| `extract_quote_images(reply)` | 被引用 `chain` 中的 `Image` 组件（保持原顺序） |
+| `build_prompt(own_text, quote_text, quote_sender_name, has_images, default_image_prompt, default_quote_prompt)` | 组装提问：`[引用消息（昵称）] 被引用内容` + 空行 + `用户自己的话`；自己没打字时按「有图 → 图片提示词 / 只有引用 → 引用提示词」补位，全空则返回 `""`（调用方据此放行） |
+
+**设计要点**：组件识别按**类名**做鸭子类型判断（`type(comp).__name__`），因此本模块 **不 import astrbot**，可在无 AstrBot 运行时的环境直接单测；`chain` / `message` 两种历史字段都兼容。
+
+### 3.4 `core/session_core.py` — 统一会话核心（全异步，多会话 + 本地 id）
 
 | 类 / 方法 | 说明 |
 |-----------|------|
@@ -137,19 +156,24 @@ astrbot_plugin_aisearch/
 - **会话删除**：`POST /api/v0/chat_session/delete`（Bearer 令牌嗅探），新旧 URL 格式（`/a/chat/s/<uuid>` 与 `/s/<id>`）均兼容
 - **元数据持久化**：每次变更写入 conversations.json（`{"next_id", "current_id", "conversations"}`）；旧版 `{mode: {...}}` 双槽位格式仍可迁移（v2.3.0 起忽略其中的 mode 字段）
 
-### 3.4 `main.py` — 插件主入口
+### 3.5 `main.py` — 插件主入口
 
 | 类 / 方法 | 说明 |
 |-----------|------|
 | `CloakSearchPlugin` | 插件主类 |
 | `ai_search_command()` | `/ais` 统一指令（send/new/session/list/switch/help） |
-| `on_message()` | `@filter.event_message_type(ALL)` 统一消息处理（v2.3.0 合并原 `on_image_message` + `on_auto_message`）：@机器人/私聊的**文本或图片** → 当前会话提问（有图片则先上传，无文字用 `DEFAULT_IMAGE_PROMPT`），无需 /ais |
+| `on_message()` | `@filter.event_message_type(ALL)` 统一消息处理（v2.3.0 合并原 `on_image_message` + `on_auto_message`；v2.3.1 支持引用消息）：@机器人/私聊的**文本 / 图片 / 引用消息** → 当前会话提问，无需 /ais。顺序：自身消息/指令让路 → 取当前消息文本与图片 → 空消息放行 → 群聊未 @ 放行（**在解析引用之前**，避免为群里无关引用发起远程拉取）→ 解析引用 → `AUTO_TRIGGER=False` 且无图则放行 → 组装 prompt（空则放行）→ `stop_event()` → 提问 |
+| `_collect_quote()` | 解析引用（Reply）消息（v2.3.1）→ `(被引用文本, 被引用图片, 发送者昵称)`；文本/图片优先用 AstrBot 官方 `extract_quoted_message_text/images`（可远程 `get_msg`、解析合并转发），旧版本或调用失败回退 `quote_parser`；图片先取 `Reply.chain` 内嵌，没有再走远程兜底 |
+| `_build_query_prompt()` | 调用 `quote_parser.build_prompt()` 组装提问：`[引用消息] 被引用内容` 在前、自己的话在后；只有引用没打字时补 `DEFAULT_QUOTE_PROMPT` |
+| `ai_search_command()` 的 `_ask()` / `_send_query()` | 指令路径同样带上引用文本/图片（v2.3.1）；`_send_query()` 有图走 `send_image_message`、无图走 `send_message`，图片全部解析失败抛 `ImagePrepareError`（回「⚠️」而非「❌ 搜索失败」） |
+| `terminate()` | 插件禁用/重载清理（v2.3.1）：取消全部空闲计时器 + `session.close()`，防止旧实例计时器销毁**新实例正在使用**的会话、以及旧浏览器进程残留 |
 | `_respond()` | 统一回复：刷新空闲计时 + 「已开启新会话」前缀 + 键盘按钮；返回空串表示已发送 |
 | `_arm_idle_timer()` / `_idle_waiter()` | 每会话独立空闲计时器：每次提问/切换/新建后重置；到点后**按真实空闲时间（last_active）二次校验**，有新活动则重新计时，超时**静默销毁**（不推送通知，避免刷屏） |
 | `_is_self_message()` | 跳过机器人自己发出的消息（部分平台会回传自身消息，防止自我回复循环） |
 | `_is_command_message()` | 跳过被 AstrBot 识别为指令的消息（waking_check 已剥离指令前缀，无法靠文本判断；检查 activated_handlers 中带 Command 类 filter 的 handler），防止自动触发拦截 /cloak登录、/ais 等指令 |
-| `_collect_images()` | 兼容新旧 AstrBot API 提取图片组件；v2.2.8 起同时收集引用消息（Reply.chain）中的图片 |
-| `_prepare_image_paths()` | 图片 → 本地路径（自动下载、PIL 压缩） |
+| `_collect_images()` | 兼容新旧 AstrBot API 提取**当前消息**的图片组件；v2.3.1 起引用图片改由 `_collect_quote` 统一提取（避免漏取/重复取） |
+| `_prepare_image_paths()` | 图片 → 本地路径（自动下载、PIL 压缩）；支持 `Image` 组件与字符串引用（`base64://` / http(s) / 本地路径，v2.3.1） |
+| `_resolve_image_ref()` / `_save_base64_image()` / `_sniff_image_ext()` | 字符串图片引用落盘（v2.3.1）：base64 解码后按文件头补 `.png/.jpg/.gif/.webp` 扩展名 |
 | `_build_keyboard()` / `_try_send_with_keyboard()` | QQ 官方平台键盘按钮消息（其余平台自动回退纯文本） |
 | `login_command()` | `/cloak登录`：后台线程扫码登录，成功后重置浏览器内核 |
 
@@ -172,7 +196,7 @@ astrbot_plugin_aisearch/
 - 消息处理器跳过**指令消息**（`_is_command_message`：activated_handlers 含 Command 类 filter 即让路；waking_check 已剥离指令前缀，不能靠文本判断），避免拦截 /cloak登录、/ais 及其他插件/内置指令
 - 回复只跟随用户提问产生（指令 / 自动触发 各一条），QQ 官方平台键盘按钮与回复合并为一条消息
 
-### 3.5 `core/login_core.py` — 登录模块
+### 3.6 `core/login_core.py` — 登录模块
 
 与 v1.x 相同，二维码容器选择器改为**兜底链**（`#wxLogin` → `.ds-sign-in-with-wechat-block` → 二维码 img → 「微信扫码登录」文本向上找容器），降低网页改版导致的登录失效风险。
 
@@ -197,19 +221,22 @@ astrbot_plugin_aisearch/
 ### 自动触发（@机器人/私聊的文本或图片，v2.2.0 新增；v2.3.0 图文合并）
 
 ```
-用户 @机器人 发送文字/图片（或私聊直接发送；也可引用一条含图片的消息）
+用户 @机器人 发送文字/图片（或私聊直接发送；也可**引用一条消息**，v2.3.1）
        │
        ▼
   on_message()（EventMessageType.ALL）
        ├─ 事件已停止 / 机器人自身消息 → 返回
        ├─ 指令消息（activated_handlers 含 Command 类 filter）→ 返回，交给指令处理器
-       ├─ 无文本且无图片 → 返回
-       ├─ 纯文本且 AUTO_TRIGGER=False → 返回（图片不受该开关限制）
-       ├─ 群聊未@未唤醒 → 返回（不拦截正常聊天）
+       ├─ 取当前消息文本（_clean_image_text）+ 当前消息图片
+       ├─ 无文本、无图片、无引用 → 返回（放行给默认 LLM）
+       ├─ 群聊未@未唤醒 → 返回（不拦截正常聊天；放在解析引用之前）
+       ├─ _collect_quote()：Reply → 被引用文本 / 图片 / 昵称
+       ├─ 无图片且 AUTO_TRIGGER=False → 返回（图片不受该开关限制）
+       ├─ build_prompt()：`[引用消息] 被引用内容` + 空行 + 自己的话；空则返回
        └─ 命中 → event.stop_event()（阻止默认 LLM 响应）
        ▼
-  有图片 → send_image_message(text, paths)（当前会话上传图片 + 提问，无文字用默认提示词）
-  仅文本 → send_message(text)
+  有图片 → send_image_message(prompt, paths)（当前会话上传图片 + 提问）
+  仅文本 → send_message(prompt)
        ▼
   _respond()：刷新空闲计时 + 前缀 + 键盘按钮 → 回复
 ```
@@ -247,14 +274,16 @@ astrbot_plugin_aisearch/
 群聊 @机器人 + 图片（或私聊图片；也可引用一条含图片的消息）
        │
        ▼
-  on_message()（EventMessageType.ALL）→ _collect_images()（当前消息 + Reply.chain）
+  on_message()（EventMessageType.ALL）
+       ├─ _collect_images()：当前消息图片
+       └─ _collect_quote() ：引用 chain 中的图片（无内嵌时用官方工具远程兜底）
        ▼
-  _prepare_image_paths()（convert_to_file_path / 下载 / PIL 压缩）
+  _prepare_image_paths()（convert_to_file_path / 引用落盘 / 下载 / PIL 压缩）
        ▼
-  send_image_message(text, paths) → (created, result)
+  send_image_message(prompt, paths) → (created, result)
        ├─ ensure_current_locked()（复用当前会话；无则新建）
        ├─ set_input_files 上传 → blob 缩略图 + 双路上传完成确认
-       └─ 输入文字（无则 DEFAULT_IMAGE_PROMPT）→ 发送 → 等待答案
+       └─ 输入文字（自己的话；没有则 DEFAULT_IMAGE_PROMPT / DEFAULT_QUOTE_PROMPT）→ 发送 → 等待答案
        ▼
   _respond() → 返回结果 + 键盘按钮
 ```
@@ -436,11 +465,26 @@ astrbot_plugin_aisearch/
 | 文案/列表同步 | ✅ | 会话列表去掉模式列；usage/help/README 全部改写为「图文同会话」表述 |
 | 单元测试 | ✅ | 指令解析 34 用例 + 会话核心 mock 测试（新增「mode 字段已移除」「旧数据 mode 被忽略」用例）全部通过；真实浏览器图文同会话端到端验证通过 |
 
+### ✅ v2.3.1 已完成功能
+
+| 功能 | 状态 | 说明 |
+|------|------|------|
+| 引用文本进入提问 | ✅ | 新增 `core/quote_parser.py`：从 `Reply.chain` / `Reply.message_str` 提取被引用文本，组装为 `[引用消息] 被引用内容` + 自己的话（引用在前）；修复「引用+提问」时 DeepSeek 只收到「回答一下这个问题」的问题 |
+| 引用图片进入上传链路 | ✅ | 引用消息 chain 中的 `Image` 由 `_collect_quote()` 统一提取并上传；`_prepare_image_paths()` 同时支持 `Image` 组件与字符串引用（`base64://` / http(s) / 本地路径） |
+| 复用 AstrBot 官方引用解析 | ✅ | 优先 `astrbot.core.utils.quoted_message.extract_quoted_message_{text,images}`（跨平台：远程 `get_msg`、合并转发），旧版本/失败回退本地纯函数；`is_at` 判断前置，避免群里无关引用触发远程拉取 |
+| 默认提示词与放行 | ✅ | 新增 `DEFAULT_QUOTE_PROMPT`（仅引用无文字时用）；引用解析为空且自己没说话 → 放行，不再向 DeepSeek 发空提问 |
+| `/ais` 指令路径同步 | ✅ | 指令提问同样带上引用文本/图片（此前只有自动触发路径支持） |
+| 插件 `terminate()` 清理 | ✅ | 卸载/重载时取消全部空闲计时器 + 关闭浏览器；修复「旧实例计时器销毁新实例正在用的会话」与浏览器进程残留 |
+| 可观测性 | ✅ | 提问日志 `📝 [AIS] 本轮提问（N 字，图片 M 张）…`；解析到引用时 `🔗 [AIS] 解析到引用消息：文本=… 图片=… 发送者=…`（DEBUG 级） |
+| 测试隔离修复 | ✅ | `test_session_core_mock.py` 改为读写临时目录（原先会读线上 `conversations.json` 导致首个断言失败、并在结尾删除线上文件） |
+| 单元测试 | ✅ | 新增 `tests/test_quote_parser.py`（纯函数）+ `tests/test_quote_flow.py`（真实 AstrBot 消息链驱动 12 项断言：引用文本/仅引用/引用图片/无引用回归/未@放行/自身消息/空引用/指令路径/AUTO_TRIGGER/长文本），四个测试脚本全部通过 |
+
 ### ⚠️ 已知问题 / 待改进
 
 - **UI 依赖**：深度思考开关、图片上传输入框等选择器基于 2026-08 上线的 DeepSeek 网页版 UI（模式合并版），改版后需更新 `session_core.py`
 - **图片链路已实测**：真实登录态下「文本 + 图片同会话」端到端验证通过（上传红色圆图 → AI 正确回答颜色与形状）
 - 多图片消息的图片顺序与文字绑定关系待实测确认
+- **引用消息链路**：已由真实 AstrBot 消息链断言覆盖（`tests/test_quote_flow.py`），QQ 群内实测待确认——重测时看日志 `📝 [AIS] 本轮提问…` 是否含被引用文本、`🔗 [AIS] 解析到引用消息…` 是否出现
 
 ### 🔮 后续开发建议
 
@@ -465,4 +509,4 @@ astrbot_plugin_aisearch/
 
 ---
 
-*文档更新日期：2026-08-30（v2.3.0）*
+*文档更新日期：2026-10-11（v2.3.1）*

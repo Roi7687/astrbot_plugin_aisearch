@@ -8,7 +8,7 @@ import time
 
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.event.filter import EventMessageType
-from astrbot.api.message_components import Image, Reply
+from astrbot.api.message_components import Image
 from astrbot.api.star import Context, Star
 from astrbot.core.star.filter.command import GreedyStr
 
@@ -18,11 +18,36 @@ from .core.config import (
     QR_FILE,
     IDLE_TIMEOUT_SECONDS,
     MAX_IMAGE_BYTES,
+    DEFAULT_IMAGE_PROMPT,
+    DEFAULT_QUOTE_PROMPT,
     AuthError,
+    ImagePrepareError,
     ConversationError,
 )
 from .core.login_core import CloakAuthenticator
+from .core.quote_parser import (
+    build_prompt,
+    extract_quote_images,
+    extract_quote_text,
+    find_reply,
+    quote_sender,
+)
 from .core.session_core import DeepSeekSessionCore
+
+try:  # AstrBot >= 4.4 官方引用消息解析工具（跨平台：内嵌 chain / 远程 get_msg / 合并转发）
+    from astrbot.core.utils.quoted_message import (
+        extract_quoted_message_images as _fw_quote_images,
+        extract_quoted_message_text as _fw_quote_text,
+    )
+except Exception:  # pragma: no cover - 旧版 AstrBot 无该模块时降级为本地解析
+    try:
+        from astrbot.core.utils.quoted_message_parser import (
+            extract_quoted_message_images as _fw_quote_images,
+            extract_quoted_message_text as _fw_quote_text,
+        )
+    except Exception:
+        _fw_quote_text = None
+        _fw_quote_images = None
 
 logger = logging.getLogger("astrbot")
 
@@ -45,6 +70,23 @@ class CloakSearchPlugin(Star):
         super().__init__(context)
         self.session = DeepSeekSessionCore()
         self._timer_tasks: dict[int, asyncio.Task] = {}   # local_id -> 空闲计时任务
+
+    async def terminate(self):
+        """插件禁用/重载时清理：取消空闲计时器 + 关闭浏览器内核。
+
+        必须显式清理（v2.3.1）：Star 基类的 terminate 是空实现，不清理会导致
+        重载后**旧实例的计时器仍在运行**——其到点后销毁的会话可能正是新实例
+        正在对话的那个（2026-10-11 日志实测：旧实例 01:16:13 销毁的会话，
+        新实例 01:17 仍在其中提问），且旧浏览器进程永不退出。
+        """
+        for task in self._timer_tasks.values():
+            if task and not task.done():
+                task.cancel()
+        self._timer_tasks.clear()
+        try:
+            await self.session.close()
+        except Exception as e:
+            logger.warning(f"⚠️ [AIS] 插件卸载时关闭浏览器失败: {e}")
 
     # ═════════════════════ 统一指令：/ais ═════════════════════
 
@@ -104,12 +146,14 @@ class CloakSearchPlugin(Star):
         # —— 提问（send）——
         text = payload["text"]
         try:
-            created, result = await self.session.send_message(text)
+            created, result = await self._ask(event, text)
             result = await self._respond(event, created, result)
             if result:
                 yield event.plain_result(result)
         except AuthError:
             yield event.plain_result(self._auth_error_text())
+        except ImagePrepareError as e:
+            yield event.plain_result(f"⚠️ {e}")
         except ConversationError as e:
             yield event.plain_result(f"❌ 搜索失败: {e}")
         except Exception as e:
@@ -119,11 +163,13 @@ class CloakSearchPlugin(Star):
 
     @filter.event_message_type(EventMessageType.ALL)
     async def on_message(self, event: AstrMessageEvent):
-        """@机器人（或私聊）发送文本或图片 → 自动进入 AI 搜索对话，无需 /ais 指令。
+        """@机器人（或私聊）发送文本、图片或**引用消息** → 自动进入 AI 搜索对话。
 
         v2.3.0：DeepSeek 官方已把「快速 / 专家 / 识图模式」合并为统一对话
         （图片理解内置于同一会话），因此文本与图片走同一条处理路径——
         图片在当前会话中上传提问，保持上下文连续。
+        v2.3.1：引用（回复）消息中的**文本与图片**一并提取，
+        `event.get_message_str()` 拿不到被引用的内容（它只在 Reply 组件里）。
         仅在需要切换/新建会话时才使用 /ais switch、/ais new 等指令。
         跳过：指令消息、机器人自己发出的消息（部分平台会回传，防止自我回复循环）。
         """
@@ -132,38 +178,127 @@ class CloakSearchPlugin(Star):
         if self._is_command_message(event):
             return  # 指令消息（/ais、/cloak登录 等）由对应指令处理器处理
 
-        images = await self._collect_images(event)
-        text = self._clean_image_text(event.get_message_str() or "")
-        if not text and not images:
-            return
-        if not images and not AUTO_TRIGGER:
-            return  # AUTO_TRIGGER 只控制纯文本自动触发（图片始终处理）
+        own_text = self._clean_image_text(event.get_message_str() or "")
+        images = list(await self._collect_images(event))
+        has_quote = find_reply(event.get_messages()) is not None
 
-        # 群聊需要 @ 机器人或唤醒词；私聊直接触发
+        if not own_text and not images and not has_quote:
+            return  # 空消息（无文字、无图片、无引用）→ 放行给默认 LLM
+
+        # 群聊需要 @ 机器人或唤醒词；私聊直接触发。
+        # 放在解析引用之前：群里的无关引用消息不会触发远程拉取。
         is_at = getattr(event, "is_at_or_wake_command", False) or event.is_private_chat()
         if not is_at:
             return
 
+        # 解析引用消息（文本 + 图片）。文本引用受 AUTO_TRIGGER 约束，
+        # 引用中的图片与直接发的图片一样始终处理。
+        quote_ctx = await self._collect_quote(event)
+        images.extend(quote_ctx[1])
+        if not images and not AUTO_TRIGGER:
+            return
+
+        prompt = self._build_query_prompt(own_text, quote_ctx, bool(images))
+        if not prompt:
+            return  # 引用内容为空且自己没有文字 → 放行给默认 LLM
+        logger.debug(
+            f"📝 [AIS] 本轮提问（{len(prompt)} 字"
+            f"{f'，图片 {len(images)} 张' if images else ''}）: {prompt[:200]}"
+        )
+
         event.stop_event()  # 阻止默认 LLM 响应
 
         try:
-            if images:
-                paths = await self._prepare_image_paths(images)
-                if not paths:
-                    yield event.plain_result("⚠️ 图片下载/解析失败，无法提交。")
-                    return
-                created, result = await self.session.send_image_message(text, paths)
-            else:
-                created, result = await self.session.send_message(text)
+            created, result = await self._send_query(prompt, images)
             result = await self._respond(event, created, result)
             if result:
                 yield event.plain_result(result)
         except AuthError:
             yield event.plain_result(self._auth_error_text())
+        except ImagePrepareError as e:
+            yield event.plain_result(f"⚠️ {e}")
         except ConversationError as e:
             yield event.plain_result(f"❌ 搜索失败: {e}")
         except Exception as e:
             yield event.plain_result(f"❌ 搜索失败: {e}")
+
+    # ═════════════════════ 提问组装（文本 + 引用消息 + 图片） ═════════════════════
+
+    @staticmethod
+    def _build_query_prompt(own_text: str, quote_ctx: tuple, has_images: bool) -> str:
+        """把「用户自己的话 + 被引用内容」组装成本轮提问（引用在前、自己的话在后）"""
+        quote_text, _quote_images, sender = quote_ctx
+        return build_prompt(
+            own_text,
+            quote_text,
+            sender,
+            has_images=has_images,
+            default_image_prompt=DEFAULT_IMAGE_PROMPT,
+            default_quote_prompt=DEFAULT_QUOTE_PROMPT,
+        )
+
+    async def _ask(self, event: AstrMessageEvent, own_text: str) -> tuple[bool, str]:
+        """/ais 指令入口：组装提问（含引用消息文本/图片）并提交给当前会话。"""
+        quote_ctx = await self._collect_quote(event)
+        images = list(await self._collect_images(event)) + list(quote_ctx[1])
+        prompt = self._build_query_prompt(own_text, quote_ctx, bool(images))
+        logger.debug(
+            f"📝 [AIS] 指令提问（{len(prompt)} 字"
+            f"{f'，图片 {len(images)} 张' if images else ''}）: {prompt[:200]}"
+        )
+        return await self._send_query(prompt, images)
+
+    async def _send_query(self, prompt: str, images: list) -> tuple[bool, str]:
+        """按有无图片分发到会话内核；图片全部解析失败时抛 ImagePrepareError。"""
+        if not images:
+            return await self.session.send_message(prompt)
+        paths = await self._prepare_image_paths(images)
+        if not paths:
+            raise ImagePrepareError("图片下载/解析失败，无法提交。")
+        return await self.session.send_image_message(prompt, paths)
+
+    async def _collect_quote(self, event: AstrMessageEvent) -> tuple[str, list, str]:
+        """提取引用消息（Reply）→ (被引用文本, 被引用图片, 发送者昵称)。
+
+        QQ 群里「引用一条消息 + @机器人 + 自己的话」时，被引用内容只在 Reply
+        组件中（chain / message_str），`get_message_str()` 只返回自己的话。
+        不做这一步，DeepSeek 只会收到「回答一下这个问题」这类指代不明的话。
+
+        文本/图片优先用 AstrBot 官方解析工具（能处理远程 get_msg、合并转发等
+        跨平台场景），失败或旧版本没有该工具时回退到本地 `quote_parser`。
+        """
+        try:
+            reply = find_reply(event.get_messages())
+        except Exception:
+            reply = None
+        if reply is None:
+            return "", [], ""
+
+        sender = quote_sender(reply)
+
+        text = ""
+        if _fw_quote_text is not None:
+            try:
+                text = str(await _fw_quote_text(event, reply) or "").strip()
+            except Exception as e:
+                logger.debug(f"[AIS] 引用文本解析（AstrBot 工具）失败，改用本地解析: {e}")
+        if not text:
+            text = extract_quote_text(reply)
+
+        # 内嵌 chain 里的图片（QQ 官方平台的引用图片在此）；没有才走远程兜底
+        images = extract_quote_images(reply)
+        if not images and _fw_quote_images is not None:
+            try:
+                images = list(await _fw_quote_images(event, reply) or [])
+            except Exception as e:
+                logger.debug(f"[AIS] 引用图片解析（AstrBot 工具）失败: {e}")
+
+        if text or images:
+            logger.debug(
+                f"🔗 [AIS] 解析到引用消息：文本={text[:80]!r}，图片 {len(images)} 张，"
+                f"发送者={sender or '未知'}"
+            )
+        return text, images, sender
 
     # ═════════════════════ 统一回复 ═════════════════════
 
@@ -254,11 +389,10 @@ class CloakSearchPlugin(Star):
     # ═════════════════════ 图片工具 ═════════════════════
 
     async def _collect_images(self, event: AstrMessageEvent) -> list:
-        """兼容新旧 AstrBot API 获取消息中的图片组件。
+        """获取**当前消息**里的图片组件（兼容新旧 AstrBot API）。
 
-        同时收集**引用消息**（Reply）中被引用消息里的图片：
-        QQ 中引用（回复）一条含图片的消息时，图片位于 Reply.chain 中，
-        需一并提取才能把图片提交给 DeepSeek。
+        引用消息里的图片不在这里处理，由 `_collect_quote()` 统一提取
+        （v2.3.1 起合并到引用解析，避免同图被重复收集）。
         """
         images = []
         get_image = getattr(event, "get_image", None)
@@ -273,28 +407,26 @@ class CloakSearchPlugin(Star):
                 images = []
         if not images:
             images = [c for c in event.get_messages() if isinstance(c, Image)]
-        # 引用消息中的图片（被引用的消息可能含图，chain 可能为 None 需防御）
-        try:
-            for c in event.get_messages():
-                if isinstance(c, Reply) and getattr(c, "chain", None):
-                    for rc in c.chain:
-                        if isinstance(rc, Image):
-                            images.append(rc)
-        except Exception:
-            pass
         return images
 
     async def _prepare_image_paths(self, images: list) -> list:
-        """将图片组件转换为本地文件路径（自动下载、过大则压缩）"""
+        """将待上传图片转换为本地文件路径（自动下载、过大则压缩）。
+
+        元素可能是 Image 组件（当前消息图片 / 引用 chain 中的图片），
+        也可能是字符串引用（AstrBot 官方解析工具返回的 URL / base64:// / 本地路径）。
+        """
         paths = []
         for img in images:
             try:
                 path = None
-                convert = getattr(img, "convert_to_file_path", None)
-                if callable(convert):
-                    path = await convert()
-                elif getattr(img, "url", None):
-                    path = await self._download_image(img.url)
+                if isinstance(img, str):
+                    path = await self._resolve_image_ref(img)
+                else:
+                    convert = getattr(img, "convert_to_file_path", None)
+                    if callable(convert):
+                        path = await convert()
+                    elif getattr(img, "url", None):
+                        path = await self._download_image(img.url)
                 if not path or not os.path.exists(path):
                     continue
                 if os.path.getsize(path) > MAX_IMAGE_BYTES:
@@ -308,6 +440,59 @@ class CloakSearchPlugin(Star):
             except Exception as e:
                 logger.warning(f"⚠️ [AIS] 图片准备失败: {e}")
         return paths
+
+    async def _resolve_image_ref(self, ref: str):
+        """把字符串形式的图片引用落成本地文件路径。
+
+        支持 AstrBot 引用解析工具返回的三种形态：
+        `base64://<数据>`、`http(s)://...` 与本地绝对路径。
+        """
+        ref = (ref or "").strip()
+        if not ref:
+            return None
+        if ref.startswith("base64://"):
+            return await self._save_base64_image(ref[len("base64://") :])
+        if ref.startswith(("http://", "https://")):
+            return await self._download_image(ref)
+        if os.path.exists(ref):
+            return ref
+        return None
+
+    async def _save_base64_image(self, payload: str):
+        """base64 图片数据 → 本地文件（按魔数补正确扩展名，便于识别 MIME）"""
+        import base64
+
+        from .core.config import PLUGIN_DIR
+
+        try:
+            data = base64.b64decode(payload, validate=False)
+        except Exception as e:
+            logger.warning(f"⚠️ [AIS] base64 图片解码失败: {e}")
+            return None
+        if not data:
+            return None
+        tmp = os.path.join(PLUGIN_DIR, "ais_tmp")
+        os.makedirs(tmp, exist_ok=True)
+        ext = self._sniff_image_ext(data)
+        dest = os.path.join(tmp, f"ais_b64_{int(time.time() * 1000)}{ext}")
+        with open(dest, "wb") as f:
+            f.write(data)
+        return dest
+
+    @staticmethod
+    def _sniff_image_ext(data: bytes) -> str:
+        """按文件头判断图片格式（无法识别时用 .img，交给 DeepSeek 自行判断）"""
+        if data.startswith(b"\x89PNG\r\n\x1a\n"):
+            return ".png"
+        if data.startswith(b"\xff\xd8\xff"):
+            return ".jpg"
+        if data.startswith(b"GIF87a") or data.startswith(b"GIF89a"):
+            return ".gif"
+        if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+            return ".webp"
+        if data.startswith(b"BM"):
+            return ".bmp"
+        return ".img"
 
     async def _download_image(self, url: str) -> str:
         """下载网络图片到临时文件"""
@@ -508,6 +693,7 @@ class CloakSearchPlugin(Star):
             "⚠️ 用法：\n"
             "• 直接发送消息（@机器人 或私聊）即可自动联网提问，无需指令\n"
             "• @机器人 + 图片（或私聊发图）→ 自动解析图片并回答\n"
+            "• 引用一条消息 + @机器人 提问 → 被引用的文字/图片一并送给 AI\n"
             "• /ais <问题> — 在当前会话提问\n\n"
             "📌 管理：/ais list（列表） ｜ /ais switch <id>（切换） ｜ "
             "/ais new（新建） ｜ /ais help（帮助）"
@@ -520,6 +706,7 @@ class CloakSearchPlugin(Star):
             "⚡ 自动触发：\n"
             "• 群聊中 @机器人 发送文字（或私聊直接发送）→ 自动联网提问，无需 /ais 指令\n"
             "• 群聊中 @机器人 发送图片（可附带文字）→ 自动理解图片并回答\n"
+            "• 引用（回复）一条消息再 @机器人 提问 → 被引用消息的文本与图片一并送给 AI\n"
             "• 文字与图片在同一会话中处理，上下文连续\n"
             "• 深度思考默认自动开启；智能搜索跟随 DeepSeek 网页端设置\n"
             "• 仅切换/新建会话时才需要指令（/ais switch、/ais new）\n\n"

@@ -20,6 +20,7 @@ AUTO_TRIGGER = True  # @机器人（或私聊）发送文本 → 自动进入 AI
 # ── DeepSeek 网页版常量 ──
 DEEPSEEK_BASE = "https://chat.deepseek.com"
 DEFAULT_IMAGE_PROMPT = "请详细描述这张图片的内容。"  # 仅图片无文字时的默认提问
+DEFAULT_QUOTE_PROMPT = "请针对我引用的这条消息进行回答。"  # 仅引用消息无文字时的默认提问
 
 # 注：v2.3.0 起 DeepSeek 已把「快速 / 专家 / 识图模式」合并为统一对话
 # （官方公告：「快速、专家、识图模式已合并升级」），图片理解内置于同一会话，
@@ -32,3 +33,7 @@ class AuthError(Exception):
 
 class ConversationError(Exception):
     """自定义异常：会话操作失败（页面异常、风控、发送失败等）"""
+
+
+class ImagePrepareError(ConversationError):
+    """自定义异常：图片下载/解析失败（当前消息图片或引用图片都无法提交）"""
