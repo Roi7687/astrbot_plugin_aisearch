@@ -21,6 +21,7 @@ AUTO_TRIGGER = True  # @机器人（或私聊）发送文本 → 自动进入 AI
 DEEPSEEK_BASE = "https://chat.deepseek.com"
 DEFAULT_IMAGE_PROMPT = "请详细描述这张图片的内容。"  # 仅图片无文字时的默认提问
 DEFAULT_QUOTE_PROMPT = "请针对我引用的这条消息进行回答。"  # 仅引用消息无文字时的默认提问
+CARD_COVER_HINT = "（随附卡片封面图，请侧重描述封面画面，并结合卡片摘要作答）"  # 卡片带封面时的提示行（v2.3.3）
 
 # 注：v2.3.0 起 DeepSeek 已把「快速 / 专家 / 识图模式」合并为统一对话
 # （官方公告：「快速、专家、识图模式已合并升级」），图片理解内置于同一会话，

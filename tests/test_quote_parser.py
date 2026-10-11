@@ -15,11 +15,15 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.quote_parser import (
     REPLY_LABEL,
     build_prompt,
+    card_cover_refs,
     clean_card_text,
+    clean_dump_text,
+    clean_forward_text,
     extract_quote_images,
     extract_quote_text,
     find_reply,
     parse_card_dump,
+    parse_forward_dump,
     quote_sender,
 )
 
@@ -33,6 +37,39 @@ source: 哔哩哔哩
 source_logo: https://open.gtimg.cn/open/app_icon/00/95/17/76/100951776_100_m.png?t=1791448425
 title: 《42中队》官方预告片「宣誓」，游戏现已开放愿望单
 preview: https://qq.ugcimg.cn/v1/vd9mc16v4u4fdiu18nu79url5qnvdhq6h0qurfl2em9inbs1l72j5g0j39i6b38s8s20ob4ukjcuolmnmlfjulu9n752u026n7q8h357l59utm035s9v8q8lkuh0l3dlgl2c8ips491q7mcv2jk7hcokrg/e9vf2tsqr6j29hl2kodb3vahlc"""
+
+CARD_COVER_URL = (
+    "https://qq.ugcimg.cn/v1/vd9mc16v4u4fdiu18nu79url5qnvdhq6h0qurfl2em9inbs1l72j5g0j39i6"
+    "b38s8s20ob4ukjcuolmnmlfjulu9n752u026n7q8h357l59utm035s9v8q8lkuh0l3dlgl2c8ips491q7mcv"
+    "2jk7hcokrg/e9vf2tsqr6j29hl2kodb3vahlc"
+)
+
+# 实测原文（2026-10-11 12:10 线上日志：引用一条合并转发消息 +「分析一下这段聊天记录」）
+QQ_FORWARD_DUMP_QUOTED = """=== 消息 1 ===
+[消息内容] [群聊的聊天记录]
+[消息类型] 引用消息
+[关联消息]
+--- 第1条 ---
+    [消息内容] https://www.bilibili.com/video/BV1cXae6mEny/
+    [发送者] 刺鸟/ty无限
+--- 第2条 ---
+    [消息内容] 实战经验解析韭留美
+    [发送者] 刺鸟/ty无限
+--- 第3条 ---
+    [消息内容] win11不能
+    [发送者] 刺鸟/ty无限"""
+
+# 同一批记录的「直接发送」形态（外层包装更少）
+QQ_FORWARD_DUMP_DIRECT = """[群聊的聊天记录]
+=== 消息 1 ===
+[消息内容] https://www.bilibili.com/video/BV1cXae6mEny/
+[发送者] 刺鸟/ty无限
+=== 消息 2 ===
+[消息内容] 实战经验解析韭留美
+[发送者] 刺鸟/ty无限
+=== 消息 3 ===
+[消息内容] win11不能
+[发送者] 刺鸟/ty无限"""
 
 
 # ── 与 AstrBot 组件同名的假组件（quote_parser 按类名做鸭子类型判断）──
@@ -277,6 +314,105 @@ def check_card(failed):
     if clean_card_text(QQ_CARD_DUMP) == QQ_CARD_DUMP:
         failed.append("card [直接发送]: 卡片文本未被清理")
 
+    # 11. 卡片封面图引用（v2.3.3）：URL 不进 prompt，但要能被单独取出去上传
+    refs = card_cover_refs(QQ_CARD_DUMP)
+    if refs != [CARD_COVER_URL]:
+        failed.append(f"card [封面引用]: {refs!r} != [{CARD_COVER_URL!r}]")
+    if card_cover_refs("今天星期几") != []:
+        failed.append("card [封面引用]: 非卡片应返回空列表")
+    if card_cover_refs("[卡片消息] 小程序\n标题: 只有标题\nsource_logo: https://a/b.png") != []:
+        failed.append("card [封面引用]: 来源图标不应被当成封面")
+    # 只有封面、没有信息字段：清理保持原文（不丢信息），但封面仍可取出
+    cover_only = f"[卡片消息] 大图\npreview: {CARD_COVER_URL}"
+    if clean_card_text(cover_only) != cover_only:
+        failed.append(f"card [仅封面回退]: {clean_card_text(cover_only)!r}")
+    if card_cover_refs(cover_only) != [CARD_COVER_URL]:
+        failed.append("card [仅封面取图]: 只有封面时也应能取到 URL")
+
+    # 12. 封面提示行进入 prompt（build_prompt 的 quote_hint）
+    hint = "（随附卡片封面图，请侧重描述封面画面，并结合卡片摘要作答）"
+    prompt = build_prompt("这是什么", clean_card_text(QQ_CARD_DUMP), "",
+                          has_images=True, quote_hint=hint)
+    if hint not in prompt or "这是什么" not in prompt:
+        failed.append(f"card [封面提示]: {prompt!r}")
+    if prompt.index(hint) > prompt.index("这是什么"):
+        failed.append("card [封面提示]: 提示行应在自己的话之前")
+
+
+def check_forward(failed):
+    """合并转发（聊天记录）文本转储清理（v2.3.3）"""
+
+    def expect(desc, got, must_contain=(), must_not_contain=(), exact=None):
+        if exact is not None and got != exact:
+            failed.append(f"forward [{desc}]: {got!r} != {exact!r}")
+            return
+        for needle in must_contain:
+            if needle not in got:
+                failed.append(f"forward [{desc}]: 缺少 {needle!r} → {got!r}")
+        for needle in must_not_contain:
+            if needle in got:
+                failed.append(f"forward [{desc}]: 不应包含 {needle!r} → {got!r}")
+
+    expected = (
+        "QQ 合并转发消息（聊天记录，共 3 条）\n"
+        "- 刺鸟/ty无限：https://www.bilibili.com/video/BV1cXae6mEny/\n"
+        "- 刺鸟/ty无限：实战经验解析韭留美\n"
+        "- 刺鸟/ty无限：win11不能"
+    )
+
+    # 1. 实测原文（引用形态 / 直接发送形态）→ 完全一致的「谁说了什么」清单
+    expect("引用形态", clean_forward_text(QQ_FORWARD_DUMP_QUOTED), exact=expected)
+    expect("直接发送形态", clean_forward_text(QQ_FORWARD_DUMP_DIRECT), exact=expected)
+    # 结构性标记与容器标题都必须清掉
+    for dump in (QQ_FORWARD_DUMP_QUOTED, QQ_FORWARD_DUMP_DIRECT):
+        expect("去除结构标记", clean_forward_text(dump),
+               must_not_contain=["=== 消息", "--- 第", "[消息内容]", "[发送者]",
+                                 "[消息类型]", "[关联消息]", "[群聊的聊天记录]"])
+
+    # 2. parse_forward_dump：条数与发送者
+    parsed = parse_forward_dump(QQ_FORWARD_DUMP_QUOTED)
+    if not parsed or parsed["total"] != 3:
+        failed.append(f"forward [解析]: {parsed!r}")
+    elif [it["sender"] for it in parsed["items"]] != ["刺鸟/ty无限"] * 3:
+        failed.append(f"forward [发送者]: {parsed['items']!r}")
+
+    # 3. 没有发送者时只列内容；多行内容合并为一行
+    no_sender = clean_forward_text("=== 消息 1 ===\n[消息内容] 第一行\n第二行")
+    expect("无发送者+多行内容", no_sender, exact="QQ 合并转发消息（聊天记录，共 1 条）\n- 第一行 第二行")
+
+    # 4. 超过上限只列前 N 条并标注剩余条数
+    big = "\n".join(
+        f"=== 消息 {i} ===\n[消息内容] 内容{i}\n[发送者] 甲" for i in range(1, 41)
+    )
+    cleaned = clean_forward_text(big)
+    expect("超长转发截断", cleaned,
+           must_contain=["共 40 条", "以下为前 30 条", "内容1", "内容30", "另有 10 条未列出"],
+           must_not_contain=["内容31"])
+
+    # 5. 非合并转发文本原样返回
+    for raw in ("今天星期几", "[图片]", "", "=== 消息 1 ===", "[群聊的聊天记录]"):
+        if clean_forward_text(raw) != raw:
+            failed.append(f"forward [非转发不改写]: {raw!r} → {clean_forward_text(raw)!r}")
+
+    # 6. 统一入口 clean_dump_text：转发与卡片分别命中，普通文本不动
+    if clean_dump_text(QQ_FORWARD_DUMP_QUOTED) != expected:
+        failed.append("forward [统一入口]: 合并转发未命中")
+    if clean_dump_text(QQ_CARD_DUMP) != clean_card_text(QQ_CARD_DUMP):
+        failed.append("forward [统一入口]: 卡片消息未命中")
+    if clean_dump_text("今天有什么大新闻") != "今天有什么大新闻":
+        failed.append("forward [统一入口]: 普通文本被改写")
+
+    # 7. 引用合并转发 + 自己的话 → 提问结构正确
+    prompt = build_prompt(
+        "分析一下这段聊天记录",
+        clean_dump_text(QQ_FORWARD_DUMP_QUOTED),
+        "",
+        default_quote_prompt="请针对我引用的这条消息进行回答。",
+    )
+    expect("合并转发进 prompt", prompt,
+           must_contain=["[引用消息]", "共 3 条", "刺鸟/ty无限：win11不能", "分析一下这段聊天记录"],
+           must_not_contain=["=== 消息", "--- 第"])
+
 
 def main():
     failed = []
@@ -286,6 +422,7 @@ def main():
     check_sender(failed)
     check_prompt(failed)
     check_card(failed)
+    check_forward(failed)
     if failed:
         for line in failed:
             print(f"FAIL: {line}")

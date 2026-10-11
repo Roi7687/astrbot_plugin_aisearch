@@ -1,7 +1,7 @@
 # astrbot_plugin_aisearch 开发文档
 
 > **插件名称**：AI搜索  
-> **版本**：v2.3.2  
+> **版本**：v2.3.3  
 > **作者**：Roi  
 > **许可证**：AGPL-3.0  
 > **仓库地址**：https://github.com/Roi7687/astrbot_plugin_aisearch  
@@ -56,6 +56,14 @@
 
 **v2.3.2 变更**：**修复卡片消息（小程序 / 音乐 / 图文…）被整段 URL 带偏**。现象（2026-10-11 11:49 线上日志）：群友引用一条 B 站小程序卡片 + @机器人「这是什么」，DeepSeek 的回答整段都在解释 `preview` 那条 CDN 链接，完全没回答「这张卡片是什么」。根因：QQ 官方平台对卡片消息的 `content` 字段是**腾讯渲染好的多行文本转储**，引用它或直接发它都会原样进入消息文本，其中 `source_logo`（图标）与 `preview`（封面）是两条**超长带签名 CDN URL**（实测整段 402 字里约 330 字是这两条 URL）。修复（`core/quote_parser.py` 新增 `parse_card_dump()` / `clean_card_text()`）：① **只保留认识的字段**——`title`/`标题`→标题、`摘要`/`desc`/`summary`→摘要、`source`/`app`/`appname`→来源、`url`/`jumpUrl`/`link`→链接；`preview`/`source_logo`/`icon`/`cover` 等资源字段与 `appid`/`type`/签名串等未知字段**一律丢弃**（不认识的内容宁可走原文兜底，也不塞进 prompt 当噪音）；② **头部重构**——`[卡片消息] 小程序` → `QQ 小程序卡片（来源：哔哩哔哩）`（无子类型则 `QQ 卡片消息`；非「卡片」类别保留原 kind）；③ **标题与摘要互相包含时只留信息量更大的一条**，不重复占 token；④ **原文兜底**——不是卡片、或清理后没有任何有效字段（例如卡片内容只有封面 URL）时**原样返回**，绝不让信息变少；⑤ 清理同时作用于**引用消息**与**直接发送的卡片消息**（`main._shrink_card_text()` 三处调用：`on_message` 当前消息、`_collect_quote` 引用、`_ask` 指令），并输出 `🃏 [AIS] 识别到X卡片消息：402 字 → 清理后 53 字…` 日志。实测同一张卡片的提问由 **415 字压到 66 字**。**注意**：卡片封面（`preview`）目前只丢弃、不上传，如需让 AI 看图可后续加开关。单元测试新增 `check_card()`（实测原文、标题/摘要去重、链接字段保留、技术字段过滤、中文冒号/无子类型兼容、非卡片不改写、无有效字段回退）与端到端 ⑬⑭⑮（引用卡片 / 直接发卡片 / 普通多行文本回归）。
 
+**v2.3.3 变更**：**卡片封面图随提问上传 + 合并转发（聊天记录）解析 + 修复多行提问被拆成多条消息**。三项：
+
+① **卡片封面图（用户需求：回答侧重图片描述 + 卡片摘要）**——`parse_card_dump()` 增加 `covers` 字段（`preview`/`cover`/`image`/`thumb`… 等封面类字段的 URL，此前是直接丢弃），新增 `card_cover_refs(text)` 供上传链路取用；`main` 把它并入待上传图片（`_prepare_image_paths` 的 http(s) 分支下载，实测 `qq.ugcimg.cn` 封面无需 Referer、直连可下载 80KB JPEG），并在卡片文本后追加 `CARD_COVER_HINT`（新增配置）「（随附卡片封面图，请侧重描述封面画面，并结合卡片摘要作答）」引导回答侧重；封面 URL 本身仍**不进入 prompt**。仅封面无信息字段时 `clean_card_text()` 保持原文返回，封面照样能取出。
+
+② **合并转发（聊天记录）解析**——QQ 对「群聊的聊天记录」的 `content` 同样是文本转储，实测两种形态（引用形态带 `=== 消息 1 ===` / `[消息类型]` / `[关联消息]` / `--- 第1条 ---` 外层包装，直接发送形态只有 `[群聊的聊天记录]` + `=== 消息 N ===`）。新增 `parse_forward_dump()` / `clean_forward_text()`：按 `[消息内容]` + `[发送者]` 成对提取，丢掉全部结构标记与容器标题，转成 `QQ 合并转发消息（聊天记录，共 3 条）` + `- 发送者：内容` 清单；多行内容合并为一行，无发送者时只列内容，超过 30 条只列前 30 条并标注剩余。新增统一入口 `clean_dump_text()`（先合并转发、再卡片消息），`main._shrink_card_text` 更名 `_shrink_dump_text` 并改用它——当前消息 / 引用消息 / `/ais` 指令三处自动同时支持两种转储。
+
+③ **修复「多行提问被拆成多条消息」（这是 12:10 提问超时的真凶）**——现象：引用合并转发提问后 180 秒无任何新回复，报「等待 AI 回答超时」（12:10 日志），而 11:49 的卡片提问则答非所问地解释封面 URL。根因不在解析而在**发送**：`session_core._type_and_send` 用 `input_box.press_sequentially(text)` 逐字输入，**逐字输入会把文本里的 `\n` 当成回车键按下**，而聊天输入框的回车就是发送——整段多行提问被拆成多条消息碎片（11:49 那条被拆成 7 条、12:10 那条约 14 条，碎片轰炸后 DeepSeek 侧没有产生新的回复块）。**humanize 下 `fill()` 同样是逐字输入**（本地探针实测 `press_sequentially` 与 `fill` 各触发 2 次提交），只有 `keyboard.insert_text()` 是原子插入（0 次提交、内容完整）。新增 `_insert_text()`：优先 `insert_text` 并回读输入框确认写入，失败才降级为「换行替换成空格」的逐字输入。新增浏览器回归测试 `tests/test_composer_typing.py`（本地 HTML 模拟受控输入框 + Enter 发送，断言逐字输入仍会拆分、insert_text 整体提交一次、单行同样正常）。
+
 ---
 
 ## 二、项目结构
@@ -66,14 +74,15 @@ astrbot_plugin_aisearch/
 │   ├── __init__.py
 │   ├── config.py              # 全局配置：路径常量、会话参数 & 自定义异常
 │   ├── command_parser.py      # /ais 指令参数解析器（纯函数，可单测）
-│   ├── quote_parser.py        # 引用消息（Reply）解析与提问组装（纯函数，可单测）
+│   ├── quote_parser.py        # 引用消息 / 卡片消息 / 合并转发的解析与提问组装（纯函数，可单测）
 │   ├── session_core.py        # 统一持久化会话核心（多会话 + 本地 id 计数）
 │   └── login_core.py          # 登录模块：微信扫码登录 DeepSeek
 ├── tests/                     # 单元测试（mock 掉浏览器依赖）
 │   ├── test_command_parser.py      # 指令解析 34 用例
-│   ├── test_quote_parser.py        # 引用消息解析 / prompt 组装（纯函数）
+│   ├── test_quote_parser.py        # 引用 / 卡片 / 合并转发解析与 prompt 组装（纯函数）
 │   ├── test_session_core_mock.py   # 会话核心 mock 测试（含旧数据迁移，隔离临时目录）
-│   └── test_quote_flow.py          # 引用消息端到端（真实 AstrBot 消息链驱动处理器）
+│   ├── test_quote_flow.py          # 引用消息端到端（真实 AstrBot 消息链驱动处理器）
+│   └── test_composer_typing.py     # 输入框写入方式回归（起无头浏览器，验证多行提问不被拆条）
 ├── __init__.py                # 包初始化文件（空）
 ├── main.py                    # 插件主入口：命令注册、异步调度、主动通知
 ├── auth_state.json            # 持久化存储的登录凭证（cookies/localStorage）
@@ -100,6 +109,7 @@ astrbot_plugin_aisearch/
 | `AUTO_TRIGGER` | 自动触发：@机器人/私聊直接提问无需 /ais（默认 True） |
 | `DEFAULT_IMAGE_PROMPT` | 仅图片无文字时的默认提问 |
 | `DEFAULT_QUOTE_PROMPT` | 仅引用消息、自己没打字时的默认提问（v2.3.1） |
+| `CARD_COVER_HINT` | 卡片带封面图时追加的提示行（v2.3.3）：「（随附卡片封面图，请侧重描述封面画面，并结合卡片摘要作答）」 |
 | `AuthError` / `ConversationError` | 自定义异常 |
 | `ImagePrepareError` | `ConversationError` 子类：图片全部下载/解析失败（v2.3.1，处理器据此回「⚠️」而非「❌ 搜索失败」） |
 
@@ -128,9 +138,13 @@ astrbot_plugin_aisearch/
 | `quote_sender(reply)` | 被引用消息的发送者昵称（QQ 官方平台为空字符串） |
 | `extract_quote_text(reply)` | 被引用文本：`chain` 中的 `Plain`/`At` 文本优先，`Reply.message_str` 兜底；非文本段转 `[图片]`/`[表情]`/`[转发消息]` 等占位符 |
 | `extract_quote_images(reply)` | 被引用 `chain` 中的 `Image` 组件（保持原顺序） |
-| `parse_card_dump(text)` | 识别 QQ 卡片消息（小程序 / 音乐 / 图文…）的腾讯文本转储（v2.3.2），返回 `{"kind", "subtype", "fields"}`；只保留认识的字段（标题/摘要/来源/链接），资源 URL（`preview`/`source_logo`/`icon`…）与 `appid`/`type`/签名串一律丢弃；不是卡片或无有效字段返回 None |
+| `parse_card_dump(text)` | 识别 QQ 卡片消息（小程序 / 音乐 / 图文…）的腾讯文本转储（v2.3.2，v2.3.3 增加封面），返回 `{"kind", "subtype", "fields", "covers"}`；只保留认识的字段（标题/摘要/来源/链接），来源图标与 `appid`/`type`/签名串一律丢弃；**封面类字段（`preview`/`cover`/`image`/`thumb`…）收集进 `covers`**；既无字段也无封面时返回 None |
+| `card_cover_refs(text)` | 卡片封面图 URL 列表（v2.3.3）——不进入 prompt，交给上传链路下载后作为图片提交，让模型直接看封面 |
+| `parse_forward_dump(text)` | 识别 QQ **合并转发（聊天记录）** 的文本转储（v2.3.3），返回 `{"items": [{"sender", "content"}], "total"}`；按 `[消息内容]` + `[发送者]` 成对提取，多行内容合并为一行，丢弃全部结构标记与容器标题；不是合并转发返回 None |
+| `clean_forward_text(text)` | 合并转发转储 → `QQ 合并转发消息（聊天记录，共 N 条）` + `- 发送者：内容` 清单；超过 30 条只列前 30 条并标注剩余；识别失败原样返回 |
+| `clean_dump_text(text)` | **统一入口**（v2.3.3）：先合并转发、再卡片消息，两者都不是则原样返回 |
 | `clean_card_text(text)` | 把卡片转储压成简洁描述（v2.3.2）：`[卡片消息] 小程序` → `QQ 小程序卡片（来源：哔哩哔哩）`，标题与摘要互相包含时只留一条；**识别失败/无有效字段时原样返回**，绝不让信息变少（实测 402 字 → 53 字） |
-| `build_prompt(own_text, quote_text, quote_sender_name, has_images, default_image_prompt, default_quote_prompt)` | 组装提问：`[引用消息（昵称）] 被引用内容` + 空行 + `用户自己的话`；自己没打字时按「有图 → 图片提示词 / 只有引用 → 引用提示词」补位，全空则返回 `""`（调用方据此放行） |
+| `build_prompt(own_text, quote_text, quote_sender_name, has_images, default_image_prompt, default_quote_prompt, quote_hint)` | 组装提问：`[引用消息（昵称）] 被引用内容` +（可选 `quote_hint` 提示行，v2.3.3 用于卡片封面）+ 空行 + `用户自己的话`；自己没打字时按「有图 → 图片提示词 / 只有引用 → 引用提示词」补位，全空则返回 `""`（调用方据此放行） |
 
 **设计要点**：组件识别按**类名**做鸭子类型判断（`type(comp).__name__`），因此本模块 **不 import astrbot**，可在无 AstrBot 运行时的环境直接单测；`chain` / `message` 两种历史字段都兼容。
 
@@ -148,6 +162,7 @@ astrbot_plugin_aisearch/
 | `destroy_conversation(local_id)` | 销毁空闲超时的会话：服务器端删除 + 记录移除（v2.2.11）；**锁内校验真实空闲**、全部销毁后 id 归 1（v2.2.12），返回是否真的有会话被销毁 |
 | `conversation_summary(local_id)` / `list_summary()` | 单个 / 全部会话展示数据（按 id 升序） |
 | `close()` | 关闭浏览器（插件卸载 / 登录刷新） |
+| `_type_and_send()` / `_insert_text()` | 输入并发送提问（v2.3.3）——`_insert_text` **优先 `page.keyboard.insert_text()` 一次性写入**（原子、不产生按键事件），失败才降级为「换行替换成空格」的逐字输入。**绝不能用逐字输入多行文本**：`\n` 会被当成回车键 = 发送，整段提问被拆成多条消息（见 v2.3.3 变更③） |
 
 **设计要点**：
 - **多会话 + 本地 id**：本地维护会话列表，`next_id` 本地递增计数（1、2、3...），持久化于 conversations.json；重启后 id 连续不重复；**v2.2.12 起没有任何存活会话时 id 归 1**（`_register` 分配前 / 全部销毁后 / 加载空文件时），新会话从 #1 重新开始
@@ -166,10 +181,10 @@ astrbot_plugin_aisearch/
 |-----------|------|
 | `CloakSearchPlugin` | 插件主类 |
 | `ai_search_command()` | `/ais` 统一指令（send/new/session/list/switch/help） |
-| `on_message()` | `@filter.event_message_type(ALL)` 统一消息处理（v2.3.0 合并原 `on_image_message` + `on_auto_message`；v2.3.1 支持引用消息）：@机器人/私聊的**文本 / 图片 / 引用消息** → 当前会话提问，无需 /ais。顺序：自身消息/指令让路 → 取当前消息文本与图片 → 空消息放行 → 群聊未 @ 放行（**在解析引用之前**，避免为群里无关引用发起远程拉取）→ 解析引用 → `AUTO_TRIGGER=False` 且无图则放行 → 组装 prompt（空则放行）→ `stop_event()` → 提问 |
-| `_collect_quote()` | 解析引用（Reply）消息（v2.3.1）→ `(被引用文本, 被引用图片, 发送者昵称)`；文本/图片优先用 AstrBot 官方 `extract_quoted_message_text/images`（可远程 `get_msg`、解析合并转发），旧版本或调用失败回退 `quote_parser`；图片先取 `Reply.chain` 内嵌，没有再走远程兜底 |
-| `_build_query_prompt()` | 调用 `quote_parser.build_prompt()` 组装提问：`[引用消息] 被引用内容` 在前、自己的话在后；只有引用没打字时补 `DEFAULT_QUOTE_PROMPT` |
-| `_shrink_card_text()` | 卡片消息清理包装（v2.3.2）：`clean_card_text()` + 「402 字 → 53 字」日志；三处调用——`on_message` 当前消息、`_collect_quote` 引用消息、`_ask` 指令提问 |
+| `on_message()` | `@filter.event_message_type(ALL)` 统一消息处理（v2.3.0 合并原 `on_image_message` + `on_auto_message`；v2.3.1 支持引用消息；v2.3.2/3 支持卡片与合并转发）：@机器人/私聊的**文本 / 图片 / 引用消息 / 卡片消息 / 合并转发** → 当前会话提问，无需 /ais。顺序：自身消息/指令让路 → 取当前消息文本与图片（含直接发送卡片的封面）→ 空消息放行 → 群聊未 @ 放行（**在解析引用之前**，避免为群里无关引用发起远程拉取）→ 解析引用 → `AUTO_TRIGGER=False` 且无图则放行 → 组装 prompt（空则放行）→ `stop_event()` → 提问 |
+| `_collect_quote()` | 解析引用（Reply）消息 → `(被引用文本, 被引用图片, 发送者昵称, 卡片封面URL)`（v2.3.3 增加第 4 项）；文本/图片优先用 AstrBot 官方 `extract_quoted_message_text/images`（可远程 `get_msg`、解析合并转发），旧版本或调用失败回退 `quote_parser`；图片先取 `Reply.chain` 内嵌，没有再走远程兜底；封面 URL 在文本清理**之前**取出 |
+| `_build_query_prompt()` | 调用 `quote_parser.build_prompt()` 组装提问：`[引用消息] 被引用内容` 在前、自己的话在后；只有引用没打字时补 `DEFAULT_QUOTE_PROMPT`；卡片带封面时补 `CARD_COVER_HINT`（引用卡片加在引用块后，直接发送的卡片加在自己的话后） |
+| `_shrink_dump_text()` | 消息文本转储清理包装（v2.3.2 卡片 / v2.3.3 合并转发）：`clean_dump_text()` + 「402 字 → 53 字」日志；三处调用——`on_message` 当前消息、`_collect_quote` 引用消息、`_ask` 指令提问 |
 | `ai_search_command()` 的 `_ask()` / `_send_query()` | 指令路径同样带上引用文本/图片（v2.3.1）；`_send_query()` 有图走 `send_image_message`、无图走 `send_message`，图片全部解析失败抛 `ImagePrepareError`（回「⚠️」而非「❌ 搜索失败」） |
 | `terminate()` | 插件禁用/重载清理（v2.3.1）：取消全部空闲计时器 + `session.close()`，防止旧实例计时器销毁**新实例正在使用**的会话、以及旧浏览器进程残留 |
 | `_respond()` | 统一回复：刷新空闲计时 + 「已开启新会话」前缀 + 键盘按钮；返回空串表示已发送 |
@@ -177,7 +192,7 @@ astrbot_plugin_aisearch/
 | `_is_self_message()` | 跳过机器人自己发出的消息（部分平台会回传自身消息，防止自我回复循环） |
 | `_is_command_message()` | 跳过被 AstrBot 识别为指令的消息（waking_check 已剥离指令前缀，无法靠文本判断；检查 activated_handlers 中带 Command 类 filter 的 handler），防止自动触发拦截 /cloak登录、/ais 等指令 |
 | `_collect_images()` | 兼容新旧 AstrBot API 提取**当前消息**的图片组件；v2.3.1 起引用图片改由 `_collect_quote` 统一提取（避免漏取/重复取） |
-| `_prepare_image_paths()` | 图片 → 本地路径（自动下载、PIL 压缩）；支持 `Image` 组件与字符串引用（`base64://` / http(s) / 本地路径，v2.3.1） |
+| `_prepare_image_paths()` | 图片 → 本地路径（自动下载、PIL 压缩）；支持 `Image` 组件、字符串引用（`base64://` / http(s) / 本地路径，v2.3.1）与**卡片封面 URL**（v2.3.3，走 http(s) 分支下载） |
 | `_resolve_image_ref()` / `_save_base64_image()` / `_sniff_image_ext()` | 字符串图片引用落盘（v2.3.1）：base64 解码后按文件头补 `.png/.jpg/.gif/.webp` 扩展名 |
 | `_build_keyboard()` / `_try_send_with_keyboard()` | QQ 官方平台键盘按钮消息（其余平台自动回退纯文本） |
 | `login_command()` | `/cloak登录`：后台线程扫码登录，成功后重置浏览器内核 |
@@ -226,21 +241,21 @@ astrbot_plugin_aisearch/
 ### 自动触发（@机器人/私聊的文本或图片，v2.2.0 新增；v2.3.0 图文合并）
 
 ```
-用户 @机器人 发送文字/图片（或私聊直接发送；也可**引用一条消息**，v2.3.1）
+用户 @机器人 发送文字/图片（或私聊直接发送；也可**引用一条消息 / 卡片消息 / 合并转发**，v2.3.1~3）
        │
        ▼
   on_message()（EventMessageType.ALL）
        ├─ 事件已停止 / 机器人自身消息 → 返回
        ├─ 指令消息（activated_handlers 含 Command 类 filter）→ 返回，交给指令处理器
-       ├─ 取当前消息文本（_clean_image_text）+ 当前消息图片
+       ├─ 取当前消息文本（_clean_image_text）+ 当前消息图片 + 卡片封面（card_cover_refs）
        ├─ 无文本、无图片、无引用 → 返回（放行给默认 LLM）
        ├─ 群聊未@未唤醒 → 返回（不拦截正常聊天；放在解析引用之前）
-       ├─ _collect_quote()：Reply → 被引用文本 / 图片 / 昵称
+       ├─ _collect_quote()：Reply → 被引用文本 / 图片 / 昵称 / 卡片封面
        ├─ 无图片且 AUTO_TRIGGER=False → 返回（图片不受该开关限制）
-       ├─ build_prompt()：`[引用消息] 被引用内容` + 空行 + 自己的话；空则返回
+       ├─ build_prompt()：`[引用消息] 被引用内容` +（卡片封面提示行）+ 空行 + 自己的话；空则返回
        └─ 命中 → event.stop_event()（阻止默认 LLM 响应）
        ▼
-  有图片 → send_image_message(prompt, paths)（当前会话上传图片 + 提问）
+  有图片（含卡片封面）→ send_image_message(prompt, paths)（当前会话上传图片 + 提问）
   仅文本 → send_message(prompt)
        ▼
   _respond()：刷新空闲计时 + 前缀 + 键盘按钮 → 回复
@@ -494,13 +509,25 @@ astrbot_plugin_aisearch/
 | 三处生效 | ✅ | `_shrink_card_text()` 同时用于当前消息、引用消息与 `/ais` 指令提问；识别到卡片时输出 `🃏 [AIS] 识别到X卡片消息：N 字 → M 字…` 日志 |
 | 单元测试 | ✅ | `check_card()`（实测原文 / 标题摘要去重 / 链接字段保留 / 技术字段过滤 / 中文冒号 / 无子类型 / 非卡片不改写 / 无有效字段回退）+ 端到端 ⑬⑭⑮（引用卡片 / 直接发卡片 / 普通多行文本回归），四个脚本全部通过 |
 
+### ✅ v2.3.3 已完成功能
+
+| 功能 | 状态 | 说明 |
+|------|------|------|
+| 卡片封面图上传 | ✅ | `parse_card_dump().covers` + `card_cover_refs()`：卡片封面 URL 不再丢弃，改为下载后作为图片提交（实测直连可下载）；prompt 中卡片文本后追加 `CARD_COVER_HINT`，引导「侧重描述封面画面 + 结合卡片摘要」 |
+| 合并转发（聊天记录）解析 | ✅ | `parse_forward_dump()` / `clean_forward_text()`：把 `=== 消息 N ===`、`[消息内容]`、`[发送者]`、`--- 第N条 ---` 等转储转成「共 N 条 + - 发送者：内容」清单；直接发送与引用两种形态都覆盖；超 30 条截断并标注 |
+| 统一转储清理入口 | ✅ | `clean_dump_text()`（合并转发 → 卡片消息）替换原先只处理卡片的调用；当前消息 / 引用 / `/ais` 三处同时生效 |
+| 多行提问不再被拆条 | ✅ | `session_core._insert_text()` 改用 `keyboard.insert_text()` 原子写入（逐字输入会把 `\n` 当回车=发送，实测把 7~14 行提问拆成多条碎片，是 12:10「等待 AI 回答超时」的真凶）；失败才降级为「换行→空格」逐字输入 |
+| 浏览器回归测试 | ✅ | 新增 `tests/test_composer_typing.py`（本地 HTML 模拟受控输入框 + Enter 发送；同时断言旧的逐字输入仍会拆分，防止将来改回去） |
+| 单元测试 | ✅ | `check_forward()`（两种形态 / 结构标记清理 / 无发送者 / 多行内容 / 超长截断 / 非转发不改写 / 统一入口）+ 卡片封面 11~12 组 + 端到端 ⑯⑰⑱⑲⑳（引用合并转发 / 直接发转发 / 引用卡片带封面 / 直接发卡片带封面 / 封面下载失败提示），五个脚本全部通过 |
+
 ### ⚠️ 已知问题 / 待改进
 
 - **UI 依赖**：深度思考开关、图片上传输入框等选择器基于 2026-08 上线的 DeepSeek 网页版 UI（模式合并版），改版后需更新 `session_core.py`
 - **图片链路已实测**：真实登录态下「文本 + 图片同会话」端到端验证通过（上传红色圆图 → AI 正确回答颜色与形状）
 - 多图片消息的图片顺序与文字绑定关系待实测确认
 - **引用消息链路**：已由真实 AstrBot 消息链断言覆盖（`tests/test_quote_flow.py`），QQ 群内实测待确认——重测时看日志 `📝 [AIS] 本轮提问…` 是否含被引用文本、`🔗 [AIS] 解析到引用消息…` 是否出现
-- **卡片封面未使用**：卡片的 `preview`（封面图）目前只丢弃、不上传，若需要 AI 看图需另加开关（QQ CDN 可能有防盗链）
+- **合并转发只取文本**：合并转发里的**图片/视频节点**目前只显示为占位（QQ 转储里是 `[图片]` 之类），未下载上传；卡片封面已支持
+- **卡片封面依赖 QQ CDN**：`preview` 是带签名的临时链接，实测可直连下载（无需 Referer）；若将来加防盗链，封面会静默降级为「无图」
 
 ### 🔮 后续开发建议
 
@@ -525,4 +552,4 @@ astrbot_plugin_aisearch/
 
 ---
 
-*文档更新日期：2026-10-11（v2.3.2）*
+*文档更新日期：2026-10-11（v2.3.3）*

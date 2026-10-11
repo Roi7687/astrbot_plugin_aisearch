@@ -519,7 +519,7 @@ class DeepSeekSessionCore:
         await input_box.wait_for(state="visible", timeout=30000)
         await input_box.click()
         await asyncio.sleep(0.3)
-        await input_box.press_sequentially(text, delay=30)
+        await self._insert_text(input_box, text)
         await asyncio.sleep(0.3)
 
         # 发送：先 Enter，再检测输入框是否清空
@@ -535,7 +535,29 @@ class DeepSeekSessionCore:
                     await send_btn.click()
             except Exception:
                 pass
-            await self._wait_textarea_cleared(6)
+
+    async def _insert_text(self, input_box, text: str):
+        """把提问一次性写入输入框（v2.3.3，多行提问的关键）。
+
+        **不能用逐字输入**：humanize 下即使 `fill()` 也是逐字「输入」，而逐字输入
+        会把文本里的 `\\n` 当成回车键按下——在聊天输入框里回车就是**发送**，
+        于是整段多行提问被拆成多条消息碎片发出去（实测 2026-10-11 11:49 的卡片
+        提问被拆成 7 条、12:10 的合并转发提问被拆成 14 条，后者还因碎片轰炸
+        导致 180 秒内没有新回复 → 报「等待 AI 回答超时」）。
+        本地探针（tests/test_composer_typing.py）实测：
+        `press_sequentially("a\\nb\\nc")` 与 `fill(...)` 各触发 2 次提交，
+        `keyboard.insert_text(...)` 触发 0 次、内容完整保留。
+        """
+        try:
+            await self.page.keyboard.insert_text(text)  # 一次性插入，不产生按键事件
+            current = (await input_box.input_value() or "").strip()
+            if current:
+                return
+            logger.debug("[Session] insert_text 后输入框为空，改用逐字输入兜底")
+        except Exception as e:
+            logger.debug(f"[Session] insert_text 失败，改用逐字输入兜底: {e}")
+        # 兜底：逐字输入（换行替换为空格，避免中途触发发送）
+        await input_box.press_sequentially(text.replace("\n", " "), delay=30)
 
     async def _wait_textarea_cleared(self, timeout: float) -> bool:
         deadline = time.time() + timeout

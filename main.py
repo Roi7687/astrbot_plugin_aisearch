@@ -18,6 +18,7 @@ from .core.config import (
     QR_FILE,
     IDLE_TIMEOUT_SECONDS,
     MAX_IMAGE_BYTES,
+    CARD_COVER_HINT,
     DEFAULT_IMAGE_PROMPT,
     DEFAULT_QUOTE_PROMPT,
     AuthError,
@@ -27,7 +28,8 @@ from .core.config import (
 from .core.login_core import CloakAuthenticator
 from .core.quote_parser import (
     build_prompt,
-    clean_card_text,
+    card_cover_refs,
+    clean_dump_text,
     extract_quote_images,
     extract_quote_text,
     find_reply,
@@ -179,10 +181,10 @@ class CloakSearchPlugin(Star):
         if self._is_command_message(event):
             return  # 指令消息（/ais、/cloak登录 等）由对应指令处理器处理
 
-        own_text = self._shrink_card_text(
-            self._clean_image_text(event.get_message_str() or ""), "当前"
-        )
-        images = list(await self._collect_images(event))
+        own_raw = self._clean_image_text(event.get_message_str() or "")
+        own_covers = card_cover_refs(own_raw)  # 直接发送的卡片：封面图随提问上传
+        own_text = self._shrink_dump_text(own_raw, "当前")
+        images = list(await self._collect_images(event)) + own_covers
         has_quote = find_reply(event.get_messages()) is not None
 
         if not own_text and not images and not has_quote:
@@ -194,14 +196,17 @@ class CloakSearchPlugin(Star):
         if not is_at:
             return
 
-        # 解析引用消息（文本 + 图片）。文本引用受 AUTO_TRIGGER 约束，
+        # 解析引用消息（文本 + 图片 + 卡片封面）。文本引用受 AUTO_TRIGGER 约束，
         # 引用中的图片与直接发的图片一样始终处理。
         quote_ctx = await self._collect_quote(event)
         images.extend(quote_ctx[1])
+        images.extend(quote_ctx[3])
         if not images and not AUTO_TRIGGER:
             return
 
-        prompt = self._build_query_prompt(own_text, quote_ctx, bool(images))
+        prompt = self._build_query_prompt(
+            own_text, quote_ctx, bool(images), bool(own_covers)
+        )
         if not prompt:
             return  # 引用内容为空且自己没有文字 → 放行给默认 LLM
         logger.debug(
@@ -228,24 +233,43 @@ class CloakSearchPlugin(Star):
     # ═════════════════════ 提问组装（文本 + 引用消息 + 图片） ═════════════════════
 
     @staticmethod
-    def _build_query_prompt(own_text: str, quote_ctx: tuple, has_images: bool) -> str:
-        """把「用户自己的话 + 被引用内容」组装成本轮提问（引用在前、自己的话在后）"""
-        quote_text, _quote_images, sender = quote_ctx
+    def _build_query_prompt(
+        own_text: str, quote_ctx: tuple, has_images: bool, own_card_cover: bool = False
+    ) -> str:
+        """把「用户自己的话 + 被引用内容」组装成本轮提问（引用在前、自己的话在后）。
+
+        卡片带封面时补一行提示（`CARD_COVER_HINT`），让模型侧重描述封面画面并
+        结合卡片摘要作答（v2.3.3）。
+        """
+        quote_text, _quote_images, sender, quote_covers = quote_ctx
+        own = own_text
+        if own_card_cover:
+            own = f"{own}\n{CARD_COVER_HINT}" if own else CARD_COVER_HINT
         return build_prompt(
-            own_text,
+            own,
             quote_text,
             sender,
             has_images=has_images,
             default_image_prompt=DEFAULT_IMAGE_PROMPT,
             default_quote_prompt=DEFAULT_QUOTE_PROMPT,
+            quote_hint=CARD_COVER_HINT if quote_covers else "",
         )
 
     async def _ask(self, event: AstrMessageEvent, own_text: str) -> tuple[bool, str]:
         """/ais 指令入口：组装提问（含引用消息文本/图片）并提交给当前会话。"""
-        own_text = self._shrink_card_text(self._clean_image_text(own_text or ""), "指令")
+        own_raw = self._clean_image_text(own_text or "")
+        own_covers = card_cover_refs(own_raw)
+        own_text = self._shrink_dump_text(own_raw, "指令")
         quote_ctx = await self._collect_quote(event)
-        images = list(await self._collect_images(event)) + list(quote_ctx[1])
-        prompt = self._build_query_prompt(own_text, quote_ctx, bool(images))
+        images = (
+            list(await self._collect_images(event))
+            + own_covers
+            + list(quote_ctx[1])
+            + list(quote_ctx[3])
+        )
+        prompt = self._build_query_prompt(
+            own_text, quote_ctx, bool(images), bool(own_covers)
+        )
         logger.debug(
             f"📝 [AIS] 指令提问（{len(prompt)} 字"
             f"{f'，图片 {len(images)} 张' if images else ''}）: {prompt[:200]}"
@@ -261,8 +285,8 @@ class CloakSearchPlugin(Star):
             raise ImagePrepareError("图片下载/解析失败，无法提交。")
         return await self.session.send_image_message(prompt, paths)
 
-    async def _collect_quote(self, event: AstrMessageEvent) -> tuple[str, list, str]:
-        """提取引用消息（Reply）→ (被引用文本, 被引用图片, 发送者昵称)。
+    async def _collect_quote(self, event: AstrMessageEvent) -> tuple[str, list, str, list]:
+        """提取引用消息（Reply）→ (被引用文本, 被引用图片, 发送者昵称, 卡片封面)。
 
         QQ 群里「引用一条消息 + @机器人 + 自己的话」时，被引用内容只在 Reply
         组件中（chain / message_str），`get_message_str()` 只返回自己的话。
@@ -270,13 +294,14 @@ class CloakSearchPlugin(Star):
 
         文本/图片优先用 AstrBot 官方解析工具（能处理远程 get_msg、合并转发等
         跨平台场景），失败或旧版本没有该工具时回退到本地 `quote_parser`。
+        被引用内容是卡片消息时，额外返回封面图 URL（v2.3.3，交给上传链路）。
         """
         try:
             reply = find_reply(event.get_messages())
         except Exception:
             reply = None
         if reply is None:
-            return "", [], ""
+            return "", [], "", ""
 
         sender = quote_sender(reply)
 
@@ -297,28 +322,31 @@ class CloakSearchPlugin(Star):
             except Exception as e:
                 logger.debug(f"[AIS] 引用图片解析（AstrBot 工具）失败: {e}")
 
-        text = self._shrink_card_text(text, "引用")
+        # 封面图 URL 必须在清理前取出（清理后卡片转储已变成描述文本）
+        covers = card_cover_refs(text)
+        text = self._shrink_dump_text(text, "引用")
 
-        if text or images:
+        if text or images or covers:
             logger.debug(
                 f"🔗 [AIS] 解析到引用消息：文本={text[:80]!r}，图片 {len(images)} 张，"
-                f"发送者={sender or '未知'}"
+                f"卡片封面 {len(covers)} 张，发送者={sender or '未知'}"
             )
-        return text, images, sender
+        return text, images, sender, covers
 
     @staticmethod
-    def _shrink_card_text(text: str, origin: str) -> str:
-        """卡片消息（小程序 / 音乐 / 图文…）文本转储 → 简洁描述（v2.3.2）。
+    def _shrink_dump_text(text: str, origin: str) -> str:
+        """QQ 消息文本转储 → 简洁描述（卡片消息 v2.3.2 / 合并转发 v2.3.3）。
 
-        QQ 官方平台把卡片渲染成多行文本，里面混着图标、封面等超长签名 URL
-        （实测模型会整段回答那条 preview 链接），这里解析出卡片类型 / 来源 /
-        标题 / 摘要并丢弃资源 URL；识别失败时原样返回，不会丢信息。
+        QQ 官方平台把卡片消息与合并转发都渲染成多行文本转储，里面混着图标、
+        封面等超长签名 URL 与 `=== 消息 N ===` 这类结构性标记；这里解析成
+        「卡片类型 + 来源 + 标题 + 摘要」或「谁说了什么」的清单。
+        识别失败时原样返回，不会丢信息。
         """
-        cleaned = clean_card_text(text)
+        cleaned = clean_dump_text(text)
         if cleaned != text:
             logger.debug(
-                f"🃏 [AIS] 识别到{origin}卡片消息：{len(text)} 字 → 清理后 "
-                f"{len(cleaned)} 字（丢弃图标/封面等资源 URL）: {cleaned[:120]}"
+                f"🃏 [AIS] 解析{origin}消息转储：{len(text)} 字 → 清理后 "
+                f"{len(cleaned)} 字: {cleaned[:160]}"
             )
         return cleaned
 

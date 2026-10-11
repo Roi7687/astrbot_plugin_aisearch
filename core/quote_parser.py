@@ -15,9 +15,11 @@ QQ 群里「引用一条消息 + @机器人 + 自己的一句话」时，AstrBot
 1. `find_reply()` —— 从消息链里找到第一个 Reply 组件；
 2. `extract_quote_text()` / `extract_quote_images()` —— 取出被引用消息的
    文本与图片（`chain` 优先，`message_str` 兜底）；
-3. `clean_card_text()` —— **卡片消息（小程序 / 音乐 / 图文…）文本转储清理**
-   （v2.3.2，见下）；
-4. `build_prompt()` —— 组装本轮真正的提问：
+3. `clean_dump_text()` —— **QQ 消息文本转储清理统一入口**：
+   - `clean_card_text()`（v2.3.2）：卡片消息（小程序 / 音乐 / 图文…）
+   - `clean_forward_text()`（v2.3.3）：合并转发（聊天记录，多条消息）
+4. `card_cover_refs()`（v2.3.3）—— 卡片封面图 URL，交给上传链路让模型看图；
+5. `build_prompt()` —— 组装本轮真正的提问：
    **被引用内容在前（带 `[引用消息]` 标记），用户自己的话在后**，
    自己的话/图片缺失时用默认提示词补位，保证 prompt 永不为空。
 
@@ -159,28 +161,45 @@ CARD_LABEL_NAMES = {
     "jumpurl": "链接",
     "跳转链接": "链接",
     "链接": "链接",
-    # 纯资源字段 → 丢弃（图标 / 封面等 URL，正是把模型带偏的噪音）
-    "preview": None,
+    # 纯资源字段 → 丢弃（来源图标等，对回答没有帮助）
     "source_logo": None,
     "sourcelogo": None,
     "icon": None,
     "logo": None,
-    "cover": None,
-    "image": None,
-    "img": None,
-    "thumb": None,
-    "thumbnail": None,
 }
+
+CARD_COVER_LABELS = {
+    # 封面图字段 → 取出 URL 交给上传链路（v2.3.3 起让模型直接看封面）
+    "preview",
+    "preview_image",
+    "previewimage",
+    "cover",
+    "cover_url",
+    "coverurl",
+    "image",
+    "img",
+    "pic",
+    "picture",
+    "thumb",
+    "thumbnail",
+}
+
+_URL_RE = re.compile(r"^(?:https?://|base64://|data:)", re.IGNORECASE)
+
+
+def _looks_like_url(value: str) -> bool:
+    return bool(_URL_RE.match((value or "").strip()))
+
 
 def parse_card_dump(text: str) -> dict | None:
     """解析 QQ 卡片消息的文本转储。
 
     只保留**认识**的字段（标题 / 摘要 / 来源 / 链接），其余（appid、type、
-    签名串等）与图标、封面一并丢弃——不认识的内容宁可走「原文兜底」，
-    也不要塞进 prompt 当噪音。
+    签名串等）与来源图标一并丢弃；封面图单独收集到 ``covers``（v2.3.3，
+    供上传给模型看图）。不认识的内容宁可走「原文兜底」，也不塞进 prompt 当噪音。
 
-    返回 ``{"kind", "subtype", "fields": [(标签, 值), ...]}``；
-    不是卡片、或清理后没有任何有效字段时返回 None（调用方保留原文）。
+    返回 ``{"kind", "subtype", "fields": [(标签, 值), ...], "covers": [url, ...]}``；
+    不是卡片、且既无有效字段也无封面时返回 None（调用方保留原文）。
     """
     if not text or not text.strip():
         return None
@@ -193,6 +212,7 @@ def parse_card_dump(text: str) -> dict | None:
         return None
 
     fields: list[tuple[str, str]] = []
+    covers: list[str] = []
     for line in lines[1:]:
         field = CARD_FIELD_RE.match(line)
         if not field:
@@ -201,18 +221,33 @@ def parse_card_dump(text: str) -> dict | None:
         if not value:
             continue
         key = field.group("label").strip().lower().replace(" ", "")
+        if key in CARD_COVER_LABELS:
+            if _looks_like_url(value):
+                covers.append(value)
+            continue
         name = CARD_LABEL_NAMES.get(key, "")
         if not name:
-            continue  # 未知字段与资源字段（图标 / 封面 / appid…）：丢弃
+            continue  # 未知字段与资源字段（图标 / appid…）：丢弃
         fields.append((name, value))
 
-    if not fields:
+    if not fields and not covers:
         return None
     return {
         "kind": header.group("kind").strip(),
         "subtype": header.group("subtype").strip(),
         "fields": fields,
+        "covers": covers,
     }
+
+
+def card_cover_refs(text: str) -> list[str]:
+    """卡片封面图引用（``preview`` / ``cover`` …，v2.3.3）。
+
+    这些 URL 不进入 prompt（会把模型带偏），而是由上传链路下载后作为图片提交，
+    让模型直接看封面。不是卡片时返回空列表。
+    """
+    parsed = parse_card_dump(text)
+    return list(parsed["covers"]) if parsed else []
 
 
 def clean_card_text(text: str) -> str:
@@ -228,7 +263,9 @@ def clean_card_text(text: str) -> str:
         preview: https://qq.ugcimg.cn/v1/…（丢弃）
     """
     parsed = parse_card_dump(text)
-    if not parsed:
+    if not parsed or not parsed["fields"]:
+        # 没有可读字段（例如卡片只有封面图）→ 原样返回，别把内容压成一句空壳
+        # （封面仍可由 card_cover_refs() 单独取出上传）
         return text
 
     kind = parsed["kind"]
@@ -261,6 +298,125 @@ def clean_card_text(text: str) -> str:
     return "\n".join(lines)
 
 
+# ═════════════════════ QQ 合并转发（聊天记录）文本转储清理（v2.3.3） ═════════════════════
+# 实测原文（2026-10-11 12:10 线上日志，引用一条合并转发消息）：
+#     === 消息 1 ===
+#     [消息内容] [群聊的聊天记录]
+#     [消息类型] 引用消息
+#     [关联消息]
+#     --- 第1条 ---
+#         [消息内容] https://www.bilibili.com/video/BV1cXae6mEny/
+#         [发送者] 刺鸟/ty无限
+#     --- 第2条 ---
+#         [消息内容] 实战经验解析韭留美
+#         [发送者] 刺鸟/ty无限
+# 直接发（未引用）时的形态省去外层包装：
+#     [群聊的聊天记录]
+#     === 消息 1 ===
+#     [消息内容] xxx
+#     [发送者] yyy
+# 两种形态都按「[消息内容] + [发送者]」成对提取，转成
+#     QQ 合并转发消息（聊天记录，共 3 条）
+#     - 刺鸟/ty无限：https://www.bilibili.com/video/BV1cXae6mEny/
+#     - 刺鸟/ty无限：实战经验解析韭留美
+#     - 刺鸟/ty无限：win11不能
+
+FORWARD_HEADER_RE = re.compile(r"^(?:=+\s*消息\s*\d+\s*=+|\[群聊的聊天记录\]|\[聊天记录\])$")
+FORWARD_ITEM_RE = re.compile(r"^-+\s*第\s*\d+\s*条\s*-+$")
+FORWARD_CONTENT_RE = re.compile(r"^\[消息内容\]\s*(?P<value>.*)$")
+FORWARD_SENDER_RE = re.compile(r"^\[发送者\]\s*(?P<value>.*)$")
+FORWARD_META_RE = re.compile(r"^\[(?:消息类型|关联消息|消息时间|消息ID|消息id)\]\s*.*$")
+FORWARD_CONTAINER_TITLES = {"[群聊的聊天记录]", "[聊天记录]", "[合并转发]", "[转发消息]"}
+FORWARD_MAX_ITEMS = 30
+"""最多列出多少条（超大转发不至于把 prompt 撑爆，超出部分标注条数）"""
+
+
+def parse_forward_dump(text: str) -> dict | None:
+    """解析 QQ 合并转发（聊天记录）的文本转储。
+
+    返回 ``{"items": [{"sender", "content"}, ...], "total": int}``；
+    不是合并转发、或没提取到任何一条消息时返回 None（调用方保留原文）。
+    """
+    if not text or not text.strip():
+        return None
+    lines = [ln.strip() for ln in text.strip().splitlines() if ln.strip()]
+    if len(lines) < 2:
+        return None
+    if not any(
+        FORWARD_HEADER_RE.match(ln) or FORWARD_ITEM_RE.match(ln) for ln in lines
+    ):
+        return None
+
+    items: list[dict[str, str]] = []
+    content: str | None = None
+    sender = ""
+
+    def flush():
+        nonlocal content, sender
+        if content is not None:
+            text_value = content.strip()
+            if text_value and text_value not in FORWARD_CONTAINER_TITLES:
+                items.append({"content": text_value, "sender": sender.strip()})
+        content, sender = None, ""
+
+    for line in lines:
+        matched = FORWARD_CONTENT_RE.match(line)
+        if matched:
+            flush()
+            content = matched.group("value")
+            continue
+        matched = FORWARD_SENDER_RE.match(line)
+        if matched:
+            if content is not None:
+                sender = matched.group("value")
+            continue
+        if (
+            FORWARD_HEADER_RE.match(line)
+            or FORWARD_ITEM_RE.match(line)
+            or FORWARD_META_RE.match(line)
+        ):
+            continue
+        if content is not None:
+            content = f"{content} {line}"  # 多行消息内容：续行合并
+    flush()
+
+    if not items:
+        return None
+    return {"items": items, "total": len(items)}
+
+
+def clean_forward_text(text: str) -> str:
+    """把合并转发转储压成「谁说了什么」的清单；识别失败时**原样返回**。"""
+    parsed = parse_forward_dump(text)
+    if not parsed:
+        return text
+
+    items = parsed["items"]
+    total = parsed["total"]
+    shown = items[:FORWARD_MAX_ITEMS]
+    head = f"QQ 合并转发消息（聊天记录，共 {total} 条）"
+    if total > len(shown):
+        head += f"，以下为前 {len(shown)} 条"
+    lines = [head]
+    for item in shown:
+        sender = item["sender"]
+        lines.append(f"- {sender}：{item['content']}" if sender else f"- {item['content']}")
+    if total > len(shown):
+        lines.append(f"…（另有 {total - len(shown)} 条未列出）")
+    return "\n".join(lines)
+
+
+def clean_dump_text(text: str) -> str:
+    """QQ 消息文本转储清理统一入口：合并转发（v2.3.3）→ 卡片消息（v2.3.2）。
+
+    两种都不是时原样返回；两个清理函数各自保证「识别失败不改写」。
+    """
+    cleaned = clean_forward_text(text)
+    if cleaned != text:
+        return cleaned
+    return clean_card_text(text)
+
+
 def build_prompt(
     own_text: str,
     quote_text: str = "",
@@ -268,12 +424,14 @@ def build_prompt(
     has_images: bool = False,
     default_image_prompt: str = "",
     default_quote_prompt: str = "",
+    quote_hint: str = "",
 ) -> str:
     """组装本轮提问文本。
 
-    结构：``[引用消息（昵称）] 被引用的内容`` + 空行 + ``用户自己的话``；
-    用户自己没说话时，按「有图 → default_image_prompt」「只有引用 →
-    default_quote_prompt」补默认提示词，保证返回非空字符串。
+    结构：``[引用消息（昵称）] 被引用的内容`` +（可选提示行）+ 空行 +
+    ``用户自己的话``；用户自己没说话时，按「有图 → default_image_prompt」
+    「只有引用 → default_quote_prompt」补默认提示词，保证返回非空字符串。
+    ``quote_hint`` 用于在引用内容后补一行说明（如「随附卡片封面图」）。
     """
     own = (own_text or "").strip()
     quoted = (quote_text or "").strip()
@@ -290,4 +448,6 @@ def build_prompt(
 
     label = f"[引用消息（{sender}）]" if sender else REPLY_LABEL
     head = f"{label} {quoted}"
+    if quote_hint:
+        head = f"{head}\n{quote_hint}"
     return f"{head}\n\n{body}" if body else head

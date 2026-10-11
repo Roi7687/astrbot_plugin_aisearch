@@ -53,6 +53,12 @@ session_core.CONVERSATIONS_FILE = os.path.join(TMP_DIR, "conversations.json")
 import astrbot_plugin_aisearch.main as plugin_main
 from core.config import DEFAULT_IMAGE_PROMPT, DEFAULT_QUOTE_PROMPT
 
+CARD_COVER_URL = (
+    "https://qq.ugcimg.cn/v1/vd9mc16v4u4fdiu18nu79url5qnvdhq6h0qurfl2em9inbs1l72j5g0j39i6"
+    "b38s8s20ob4ukjcuolmnmlfjulu9n752u026n7q8h357l59utm035s9v8q8lkuh0l3dlgl2c8ips491q7mcv"
+    "2jk7hcokrg/e9vf2tsqr6j29hl2kodb3vahlc"
+)
+
 BOT_ID = "F9F5BCD9CCABB46B5B5B6B5E671C1BCF"
 USER_ID = "3A9027AED45B5058E2F58D938516F36F"
 QUOTE_ID = "QUOTED-MSG-ID"
@@ -72,6 +78,21 @@ source: 哔哩哔哩
 source_logo: https://open.gtimg.cn/open/app_icon/00/95/17/76/100951776_100_m.png?t=1791448425
 title: 《42中队》官方预告片「宣誓」，游戏现已开放愿望单
 preview: https://qq.ugcimg.cn/v1/vd9mc16v4u4fdiu18nu79url5qnvdhq6h0qurfl2em9inbs1l72j5g0j39i6b38s8s20ob4ukjcuolmnmlfjulu9n752u026n7q8h357l59utm035s9v8q8lkuh0l3dlgl2c8ips491q7mcv2jk7hcokrg/e9vf2tsqr6j29hl2kodb3vahlc"""
+
+# QQ 合并转发（聊天记录）的文本转储——实测原文（2026-10-11 12:10 线上日志）
+QQ_FORWARD_DUMP = """=== 消息 1 ===
+[消息内容] [群聊的聊天记录]
+[消息类型] 引用消息
+[关联消息]
+--- 第1条 ---
+    [消息内容] https://www.bilibili.com/video/BV1cXae6mEny/
+    [发送者] 刺鸟/ty无限
+--- 第2条 ---
+    [消息内容] 实战经验解析韭留美
+    [发送者] 刺鸟/ty无限
+--- 第3条 ---
+    [消息内容] win11不能
+    [发送者] 刺鸟/ty无限"""
 
 
 class FakeSession:
@@ -321,6 +342,92 @@ async def main():
         check(failed, "⑮ 普通多行文本不应被改写",
               plugin.session.calls[0]["text"] == "时间: 明天\n地点: 公司",
               plugin.session.calls[0]["text"])
+
+    # ⑯ 引用**合并转发**（v2.3.3）：解析成「谁说了什么」，结构标记不进 prompt
+    plugin = make_plugin()
+    await collect(plugin.on_message(
+        build_event("分析一下这段聊天记录", quote_text=QQ_FORWARD_DUMP)
+    ))
+    check(failed, "⑯ 引用合并转发应提问", len(plugin.session.calls) == 1,
+          f"calls={plugin.session.calls}")
+    if plugin.session.calls:
+        text = plugin.session.calls[0]["text"]
+        check(failed, "⑯ 应解析出条数与说话人",
+              "共 3 条" in text and "刺鸟/ty无限：win11不能" in text, text)
+        check(failed, "⑯ 结构标记不应进入 prompt",
+              "=== 消息" not in text and "--- 第" not in text
+              and "[消息内容]" not in text and "[发送者]" not in text, text)
+        check(failed, "⑯ 提问应包含自己的话", "分析一下这段聊天记录" in text, text)
+
+    # ⑰ 直接发送合并转发（未引用）同样被解析
+    plugin = make_plugin()
+    await collect(plugin.on_message(build_event(
+        "[群聊的聊天记录]\n=== 消息 1 ===\n[消息内容] 甲说的话\n[发送者] 张三"
+    )))
+    if plugin.session.calls:
+        text = plugin.session.calls[0]["text"]
+        check(failed, "⑰ 直接发送的合并转发应被解析",
+              "共 1 条" in text and "张三：甲说的话" in text, text)
+
+    # ⑱ 卡片封面图随提问上传（v2.3.3）：下载走桩，断言图片数量与提示行
+    original_download = plugin_main.CloakSearchPlugin._download_image
+
+    async def fake_download(self, url):
+        fake_download.urls.append(url)
+        return PNG_PATH
+
+    fake_download.urls = []
+    plugin_main.CloakSearchPlugin._download_image = fake_download
+    try:
+        plugin = make_plugin()
+        await collect(plugin.on_message(build_event("这是什么", quote_text=QQ_CARD_DUMP)))
+        check(failed, "⑱ 卡片封面应走图片链路",
+              len(plugin.session.calls) == 1
+              and plugin.session.calls[0]["kind"] == "image",
+              f"calls={plugin.session.calls}")
+        if plugin.session.calls:
+            call = plugin.session.calls[0]
+            check(failed, "⑱ 应下载封面图 URL",
+                  fake_download.urls == [CARD_COVER_URL], f"{fake_download.urls}")
+            check(failed, "⑱ 封面应作为 1 张图片提交", len(call["paths"]) == 1,
+                  str(call["paths"]))
+            check(failed, "⑱ 应附封面提示行",
+                  "随附卡片封面图" in call["text"], call["text"])
+            check(failed, "⑱ 封面 URL 不应进入 prompt",
+                  "qq.ugcimg.cn" not in call["text"], call["text"])
+            check(failed, "⑱ 卡片摘要仍应在 prompt 中",
+                  "摘要：" in call["text"] and "这是什么" in call["text"], call["text"])
+
+        # ⑲ 直接发送的卡片同样上传封面
+        fake_download.urls = []
+        plugin = make_plugin()
+        await collect(plugin.on_message(build_event(QQ_CARD_DUMP)))
+        check(failed, "⑲ 直接发送卡片也应上传封面",
+              len(plugin.session.calls) == 1
+              and plugin.session.calls[0]["kind"] == "image"
+              and len(plugin.session.calls[0]["paths"]) == 1,
+              f"calls={plugin.session.calls}")
+        if plugin.session.calls:
+            check(failed, "⑲ 应附封面提示行",
+                  "随附卡片封面图" in plugin.session.calls[0]["text"],
+                  plugin.session.calls[0]["text"])
+
+        # ⑳ 封面下载失败 → 报「⚠️ 图片下载/解析失败」而不是崩溃或静默
+        async def failing_download(self, url):
+            return None
+
+        plugin_main.CloakSearchPlugin._download_image = failing_download
+        plugin = make_plugin()
+        results = await collect(plugin.on_message(
+            build_event("这是什么", quote_text=QQ_CARD_DUMP)
+        ))
+        check(failed, "⑳ 封面下载失败应提示",
+              plugin.session.calls == [] and results
+              and "图片下载/解析失败" in str(results[0].chain[0].text
+                                          if getattr(results[0], "chain", None) else results[0]),
+              f"calls={plugin.session.calls} results={results}")
+    finally:
+        plugin_main.CloakSearchPlugin._download_image = original_download
 
     if failed:
         for line in failed:
