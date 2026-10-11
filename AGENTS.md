@@ -1,7 +1,7 @@
 # astrbot_plugin_aisearch 开发文档
 
 > **插件名称**：AI搜索  
-> **版本**：v2.3.1  
+> **版本**：v2.3.2  
 > **作者**：Roi  
 > **许可证**：AGPL-3.0  
 > **仓库地址**：https://github.com/Roi7687/astrbot_plugin_aisearch  
@@ -53,6 +53,8 @@
 **v2.3.0 变更**：**合并普通/识图模式，清除模式相关冗余代码**——DeepSeek 网页端改版，官方公告「快速、专家、识图模式已合并升级」（输入区提示：全新模型上线，同时具备日常对话、图片理解与复杂问题解决能力）；实测确认「识图模式」入口已从页面消失（模式栏仅剩「深度思考」「智能搜索」两个开关，原「联网搜索」更名为「智能搜索」），输入框原生支持图片上传（`input[type=file]` accept 含图片类型、multiple）。插件同步调整：① **合并处理链路**：`on_image_message` + `on_auto_message` 合并为单一 `on_message`，文本与图片走同一路径（图片在**当前会话**中上传提问，保持上下文连续，不再另开识图会话）；② **删除模式体系**：`MODE_NORMAL` / `MODE_VISION` / `MODES` / `MODE_LABELS` / `VISION_WELCOME_TEXT` / `VISION_DEBUG_SHOT` 等常量（`DEFAULT_VISION_PROMPT` 改名 `DEFAULT_IMAGE_PROMPT`）、`Conversation.mode` 字段、`current_mode` 属性、`ensure_mode()` / `_latest_of_mode()` 方法、`command_parser.MODE_ALIASES`（`/ais switch 识图/普通` 取消，只按本地 id 切换）；③ **删除识图入口相关代码**：`_switch_to_vision` / `_in_vision_state` / `_click_vision_entry` / `_expand_vision_menu` / `_dump_vision_failure` 及 `VISION_ENTRY_*` / `VISION_EXPAND_LABELS` 常量（约 137 行）与 `vision_debug.png` 留档机制；④ 会话列表不再显示模式列（`👉 1 ｜ 3 条 ｜ 最后活跃 08-30 17:14`），usage/help/README 文案同步。旧数据兼容：conversations.json 中残留的 `mode` 字段被 `Conversation.from_dict` 自动忽略，v2.0 双槽位旧格式仍可迁移。**真实浏览器端到端验证**：先发文本（「收到」）再在同一会话发图（红底白圆），`created=False` 复用会话且 AI 正确回答「主要是红色，图中还有一个白色圆形」。
 
 **v2.3.1 变更**：**修复 QQ 群引用（回复）消息解析——被引用内容丢失导致 AI 答非所问**。现象（2026-10-11 01:17:41 线上日志）：群友「引用一条消息 + @机器人 + 回答一下这个问题」，DeepSeek 收到后回「请把你想让我回答的问题发出来」。根因：AstrBot 的消息链是 `[Reply(被引用内容), At(机器人), Plain(自己的话)]`，而 `event.get_message_str()` **只含「自己的话」**——被引用的文本/图片只存在于 `Reply` 组件（`chain` / `message_str`）中，插件此前只取 `message_str` 就发给 DeepSeek，「这个问题」指代不明。修复（新增 `core/quote_parser.py` 纯函数模块 + `main.py` 接线）：① **引用文本入 prompt**——`[引用消息] 被引用内容` 在前、用户自己的话在后（有 `sender_nickname` 时标注发送者；QQ 官方平台昵称为空则用 `[引用消息]`）；② **引用图片上传**——`Reply.chain` 中的 `Image` 单独收集并上传（此前混在 `_collect_images` 里，v2.3.1 起统一由 `_collect_quote` 提取，避免漏取/重复取）；③ **优先复用 AstrBot 官方解析工具**（`astrbot.core.utils.quoted_message.extract_quoted_message_{text,images}`，AstrBot ≥ 4.4）——可处理远程 `get_msg`、合并转发等跨平台场景，旧版本或调用失败时回退本地 `quote_parser`；为防群里无关引用消息触发远程拉取，`is_at` 判断前置到解析之前；④ **默认提示词补位**——只有引用、自己没打字时用 `DEFAULT_QUOTE_PROMPT`（新增，引用图片无文字仍用 `DEFAULT_IMAGE_PROMPT`）；⑤ **引用解析为空且自己没说话 → 放行**（不再向 DeepSeek 发空提问）；⑥ **可观测性**——每次提问输出 `📝 [AIS] 本轮提问（N 字…）`、解析到引用时输出 `🔗 [AIS] 解析到引用消息：…`（DEBUG）。**顺带修复**：⑦ `/ais` 指令路径同样带上引用文本/图片（此前只有自动触发路径）；⑧ **插件 `terminate()` 清理**——`Star.terminate` 是空实现，重载后旧实例的空闲计时器仍在运行并可能销毁**新实例正在对话**的会话（日志实测：旧实例 01:16:13 销毁的会话，新实例 01:17 仍在其内提问），浏览器进程也不退出；现于卸载/重载时取消全部计时器并 `session.close()`；⑨ **测试隔离修复**——`test_session_core_mock.py` 原先读写并 `os.remove` **线上** `conversations.json`（有数据时首个断言即失败、且会删掉线上会话元数据），改为指向临时目录。单元测试新增 `tests/test_quote_parser.py`（引用解析与 prompt 组装，纯函数）与 `tests/test_quote_flow.py`（真实 AstrBot 消息链驱动 `on_message`/`ai_search_command` 的 12 项端到端断言）。
+
+**v2.3.2 变更**：**修复卡片消息（小程序 / 音乐 / 图文…）被整段 URL 带偏**。现象（2026-10-11 11:49 线上日志）：群友引用一条 B 站小程序卡片 + @机器人「这是什么」，DeepSeek 的回答整段都在解释 `preview` 那条 CDN 链接，完全没回答「这张卡片是什么」。根因：QQ 官方平台对卡片消息的 `content` 字段是**腾讯渲染好的多行文本转储**，引用它或直接发它都会原样进入消息文本，其中 `source_logo`（图标）与 `preview`（封面）是两条**超长带签名 CDN URL**（实测整段 402 字里约 330 字是这两条 URL）。修复（`core/quote_parser.py` 新增 `parse_card_dump()` / `clean_card_text()`）：① **只保留认识的字段**——`title`/`标题`→标题、`摘要`/`desc`/`summary`→摘要、`source`/`app`/`appname`→来源、`url`/`jumpUrl`/`link`→链接；`preview`/`source_logo`/`icon`/`cover` 等资源字段与 `appid`/`type`/签名串等未知字段**一律丢弃**（不认识的内容宁可走原文兜底，也不塞进 prompt 当噪音）；② **头部重构**——`[卡片消息] 小程序` → `QQ 小程序卡片（来源：哔哩哔哩）`（无子类型则 `QQ 卡片消息`；非「卡片」类别保留原 kind）；③ **标题与摘要互相包含时只留信息量更大的一条**，不重复占 token；④ **原文兜底**——不是卡片、或清理后没有任何有效字段（例如卡片内容只有封面 URL）时**原样返回**，绝不让信息变少；⑤ 清理同时作用于**引用消息**与**直接发送的卡片消息**（`main._shrink_card_text()` 三处调用：`on_message` 当前消息、`_collect_quote` 引用、`_ask` 指令），并输出 `🃏 [AIS] 识别到X卡片消息：402 字 → 清理后 53 字…` 日志。实测同一张卡片的提问由 **415 字压到 66 字**。**注意**：卡片封面（`preview`）目前只丢弃、不上传，如需让 AI 看图可后续加开关。单元测试新增 `check_card()`（实测原文、标题/摘要去重、链接字段保留、技术字段过滤、中文冒号/无子类型兼容、非卡片不改写、无有效字段回退）与端到端 ⑬⑭⑮（引用卡片 / 直接发卡片 / 普通多行文本回归）。
 
 ---
 
@@ -126,6 +128,8 @@ astrbot_plugin_aisearch/
 | `quote_sender(reply)` | 被引用消息的发送者昵称（QQ 官方平台为空字符串） |
 | `extract_quote_text(reply)` | 被引用文本：`chain` 中的 `Plain`/`At` 文本优先，`Reply.message_str` 兜底；非文本段转 `[图片]`/`[表情]`/`[转发消息]` 等占位符 |
 | `extract_quote_images(reply)` | 被引用 `chain` 中的 `Image` 组件（保持原顺序） |
+| `parse_card_dump(text)` | 识别 QQ 卡片消息（小程序 / 音乐 / 图文…）的腾讯文本转储（v2.3.2），返回 `{"kind", "subtype", "fields"}`；只保留认识的字段（标题/摘要/来源/链接），资源 URL（`preview`/`source_logo`/`icon`…）与 `appid`/`type`/签名串一律丢弃；不是卡片或无有效字段返回 None |
+| `clean_card_text(text)` | 把卡片转储压成简洁描述（v2.3.2）：`[卡片消息] 小程序` → `QQ 小程序卡片（来源：哔哩哔哩）`，标题与摘要互相包含时只留一条；**识别失败/无有效字段时原样返回**，绝不让信息变少（实测 402 字 → 53 字） |
 | `build_prompt(own_text, quote_text, quote_sender_name, has_images, default_image_prompt, default_quote_prompt)` | 组装提问：`[引用消息（昵称）] 被引用内容` + 空行 + `用户自己的话`；自己没打字时按「有图 → 图片提示词 / 只有引用 → 引用提示词」补位，全空则返回 `""`（调用方据此放行） |
 
 **设计要点**：组件识别按**类名**做鸭子类型判断（`type(comp).__name__`），因此本模块 **不 import astrbot**，可在无 AstrBot 运行时的环境直接单测；`chain` / `message` 两种历史字段都兼容。
@@ -165,6 +169,7 @@ astrbot_plugin_aisearch/
 | `on_message()` | `@filter.event_message_type(ALL)` 统一消息处理（v2.3.0 合并原 `on_image_message` + `on_auto_message`；v2.3.1 支持引用消息）：@机器人/私聊的**文本 / 图片 / 引用消息** → 当前会话提问，无需 /ais。顺序：自身消息/指令让路 → 取当前消息文本与图片 → 空消息放行 → 群聊未 @ 放行（**在解析引用之前**，避免为群里无关引用发起远程拉取）→ 解析引用 → `AUTO_TRIGGER=False` 且无图则放行 → 组装 prompt（空则放行）→ `stop_event()` → 提问 |
 | `_collect_quote()` | 解析引用（Reply）消息（v2.3.1）→ `(被引用文本, 被引用图片, 发送者昵称)`；文本/图片优先用 AstrBot 官方 `extract_quoted_message_text/images`（可远程 `get_msg`、解析合并转发），旧版本或调用失败回退 `quote_parser`；图片先取 `Reply.chain` 内嵌，没有再走远程兜底 |
 | `_build_query_prompt()` | 调用 `quote_parser.build_prompt()` 组装提问：`[引用消息] 被引用内容` 在前、自己的话在后；只有引用没打字时补 `DEFAULT_QUOTE_PROMPT` |
+| `_shrink_card_text()` | 卡片消息清理包装（v2.3.2）：`clean_card_text()` + 「402 字 → 53 字」日志；三处调用——`on_message` 当前消息、`_collect_quote` 引用消息、`_ask` 指令提问 |
 | `ai_search_command()` 的 `_ask()` / `_send_query()` | 指令路径同样带上引用文本/图片（v2.3.1）；`_send_query()` 有图走 `send_image_message`、无图走 `send_message`，图片全部解析失败抛 `ImagePrepareError`（回「⚠️」而非「❌ 搜索失败」） |
 | `terminate()` | 插件禁用/重载清理（v2.3.1）：取消全部空闲计时器 + `session.close()`，防止旧实例计时器销毁**新实例正在使用**的会话、以及旧浏览器进程残留 |
 | `_respond()` | 统一回复：刷新空闲计时 + 「已开启新会话」前缀 + 键盘按钮；返回空串表示已发送 |
@@ -479,12 +484,23 @@ astrbot_plugin_aisearch/
 | 测试隔离修复 | ✅ | `test_session_core_mock.py` 改为读写临时目录（原先会读线上 `conversations.json` 导致首个断言失败、并在结尾删除线上文件） |
 | 单元测试 | ✅ | 新增 `tests/test_quote_parser.py`（纯函数）+ `tests/test_quote_flow.py`（真实 AstrBot 消息链驱动 12 项断言：引用文本/仅引用/引用图片/无引用回归/未@放行/自身消息/空引用/指令路径/AUTO_TRIGGER/长文本），四个测试脚本全部通过 |
 
+### ✅ v2.3.2 已完成功能
+
+| 功能 | 状态 | 说明 |
+|------|------|------|
+| 卡片消息解析 | ✅ | 新增 `parse_card_dump()` / `clean_card_text()`：把腾讯渲染的卡片文本转储解析成「卡片类型 + 来源 + 标题 + 摘要」，丢弃图标 / 封面等超长签名 URL（实测 402 字 → 53 字，提问 415 字 → 66 字） |
+| 只保留认识的字段 | ✅ | 未知字段（`appid` / `type` / 签名串）与资源字段（`preview` / `source_logo` / `icon` / `cover`…）一律丢弃；不认识的宁可走原文兜底，也不塞进 prompt 当噪音 |
+| 原文兜底 | ✅ | 不是卡片、或清理后无有效字段（例如卡片只有封面 URL）时**原样返回**，绝不让信息变少 |
+| 三处生效 | ✅ | `_shrink_card_text()` 同时用于当前消息、引用消息与 `/ais` 指令提问；识别到卡片时输出 `🃏 [AIS] 识别到X卡片消息：N 字 → M 字…` 日志 |
+| 单元测试 | ✅ | `check_card()`（实测原文 / 标题摘要去重 / 链接字段保留 / 技术字段过滤 / 中文冒号 / 无子类型 / 非卡片不改写 / 无有效字段回退）+ 端到端 ⑬⑭⑮（引用卡片 / 直接发卡片 / 普通多行文本回归），四个脚本全部通过 |
+
 ### ⚠️ 已知问题 / 待改进
 
 - **UI 依赖**：深度思考开关、图片上传输入框等选择器基于 2026-08 上线的 DeepSeek 网页版 UI（模式合并版），改版后需更新 `session_core.py`
 - **图片链路已实测**：真实登录态下「文本 + 图片同会话」端到端验证通过（上传红色圆图 → AI 正确回答颜色与形状）
 - 多图片消息的图片顺序与文字绑定关系待实测确认
 - **引用消息链路**：已由真实 AstrBot 消息链断言覆盖（`tests/test_quote_flow.py`），QQ 群内实测待确认——重测时看日志 `📝 [AIS] 本轮提问…` 是否含被引用文本、`🔗 [AIS] 解析到引用消息…` 是否出现
+- **卡片封面未使用**：卡片的 `preview`（封面图）目前只丢弃、不上传，若需要 AI 看图需另加开关（QQ CDN 可能有防盗链）
 
 ### 🔮 后续开发建议
 
@@ -509,4 +525,4 @@ astrbot_plugin_aisearch/
 
 ---
 
-*文档更新日期：2026-10-11（v2.3.1）*
+*文档更新日期：2026-10-11（v2.3.2）*

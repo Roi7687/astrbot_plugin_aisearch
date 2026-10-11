@@ -65,6 +65,14 @@ PNG_PATH = os.path.join(TMP_DIR, "quoted.png")
 with open(PNG_PATH, "wb") as f:
     f.write(PNG_BYTES)
 
+# QQ 卡片消息（小程序）的文本转储——实测原文（2026-10-11 11:49 线上日志）
+QQ_CARD_DUMP = """[卡片消息] 小程序
+摘要: [QQ小程序]《42中队》官方预告片「宣誓」，游戏现已开放愿望单
+source: 哔哩哔哩
+source_logo: https://open.gtimg.cn/open/app_icon/00/95/17/76/100951776_100_m.png?t=1791448425
+title: 《42中队》官方预告片「宣誓」，游戏现已开放愿望单
+preview: https://qq.ugcimg.cn/v1/vd9mc16v4u4fdiu18nu79url5qnvdhq6h0qurfl2em9inbs1l72j5g0j39i6b38s8s20ob4ukjcuolmnmlfjulu9n752u026n7q8h357l59utm035s9v8q8lkuh0l3dlgl2c8ips491q7mcv2jk7hcokrg/e9vf2tsqr6j29hl2kodb3vahlc"""
+
 
 class FakeSession:
     """记录发给 DeepSeek 的提问（不启动浏览器）"""
@@ -279,6 +287,40 @@ async def main():
     if plugin.session.calls:
         check(failed, "⑫ 长引用应完整进入 prompt",
               long_text in plugin.session.calls[0]["text"])
+
+    # ⑬ 引用**卡片消息**（v2.3.2）：腾讯文本转储被清理成卡片描述，资源 URL 不进 prompt
+    plugin = make_plugin()
+    await collect(plugin.on_message(build_event("这是什么", quote_text=QQ_CARD_DUMP)))
+    check(failed, "⑬ 引用卡片应触发提问", len(plugin.session.calls) == 1,
+          f"calls={plugin.session.calls}")
+    if plugin.session.calls:
+        text = plugin.session.calls[0]["text"]
+        check(failed, "⑬ 卡片应被解析出类型与来源",
+              "QQ 小程序卡片" in text and "来源：哔哩哔哩" in text, text)
+        check(failed, "⑬ 卡片标题应保留", "《42中队》官方预告片「宣誓」" in text, text)
+        check(failed, "⑬ 图标/封面 URL 不应进入 prompt",
+              "qq.ugcimg.cn" not in text and "open.gtimg.cn" not in text
+              and "source_logo" not in text, text)
+        check(failed, "⑬ 提问应包含自己的话", "这是什么" in text, text)
+        check(failed, "⑬ 卡片清理后应显著变短", len(text) < 150, f"{len(text)} 字")
+
+    # ⑭ 直接发送卡片消息（未引用）同样被清理
+    plugin = make_plugin()
+    await collect(plugin.on_message(build_event(QQ_CARD_DUMP)))
+    check(failed, "⑭ 直接发送卡片应提问", len(plugin.session.calls) == 1,
+          f"calls={plugin.session.calls}")
+    if plugin.session.calls:
+        text = plugin.session.calls[0]["text"]
+        check(failed, "⑭ 直接发送的卡片也应被清理",
+              "QQ 小程序卡片" in text and "qq.ugcimg.cn" not in text, text)
+
+    # ⑮ 非卡片文本不被改写（回归）
+    plugin = make_plugin()
+    await collect(plugin.on_message(build_event("时间: 明天\n地点: 公司")))
+    if plugin.session.calls:
+        check(failed, "⑮ 普通多行文本不应被改写",
+              plugin.session.calls[0]["text"] == "时间: 明天\n地点: 公司",
+              plugin.session.calls[0]["text"])
 
     if failed:
         for line in failed:

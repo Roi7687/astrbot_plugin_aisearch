@@ -27,6 +27,7 @@ from .core.config import (
 from .core.login_core import CloakAuthenticator
 from .core.quote_parser import (
     build_prompt,
+    clean_card_text,
     extract_quote_images,
     extract_quote_text,
     find_reply,
@@ -178,7 +179,9 @@ class CloakSearchPlugin(Star):
         if self._is_command_message(event):
             return  # 指令消息（/ais、/cloak登录 等）由对应指令处理器处理
 
-        own_text = self._clean_image_text(event.get_message_str() or "")
+        own_text = self._shrink_card_text(
+            self._clean_image_text(event.get_message_str() or ""), "当前"
+        )
         images = list(await self._collect_images(event))
         has_quote = find_reply(event.get_messages()) is not None
 
@@ -239,6 +242,7 @@ class CloakSearchPlugin(Star):
 
     async def _ask(self, event: AstrMessageEvent, own_text: str) -> tuple[bool, str]:
         """/ais 指令入口：组装提问（含引用消息文本/图片）并提交给当前会话。"""
+        own_text = self._shrink_card_text(self._clean_image_text(own_text or ""), "指令")
         quote_ctx = await self._collect_quote(event)
         images = list(await self._collect_images(event)) + list(quote_ctx[1])
         prompt = self._build_query_prompt(own_text, quote_ctx, bool(images))
@@ -293,12 +297,30 @@ class CloakSearchPlugin(Star):
             except Exception as e:
                 logger.debug(f"[AIS] 引用图片解析（AstrBot 工具）失败: {e}")
 
+        text = self._shrink_card_text(text, "引用")
+
         if text or images:
             logger.debug(
                 f"🔗 [AIS] 解析到引用消息：文本={text[:80]!r}，图片 {len(images)} 张，"
                 f"发送者={sender or '未知'}"
             )
         return text, images, sender
+
+    @staticmethod
+    def _shrink_card_text(text: str, origin: str) -> str:
+        """卡片消息（小程序 / 音乐 / 图文…）文本转储 → 简洁描述（v2.3.2）。
+
+        QQ 官方平台把卡片渲染成多行文本，里面混着图标、封面等超长签名 URL
+        （实测模型会整段回答那条 preview 链接），这里解析出卡片类型 / 来源 /
+        标题 / 摘要并丢弃资源 URL；识别失败时原样返回，不会丢信息。
+        """
+        cleaned = clean_card_text(text)
+        if cleaned != text:
+            logger.debug(
+                f"🃏 [AIS] 识别到{origin}卡片消息：{len(text)} 字 → 清理后 "
+                f"{len(cleaned)} 字（丢弃图标/封面等资源 URL）: {cleaned[:120]}"
+            )
+        return cleaned
 
     # ═════════════════════ 统一回复 ═════════════════════
 
